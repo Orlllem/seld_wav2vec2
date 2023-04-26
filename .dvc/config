@@ -1,0 +1,5 @@
+[core]
+    remote = remote
+['remote "remote"']
+    url = put-your-url-here
+    gdrive_user_credentials_file = put-your-json-config-path-here
