@@ -1,0 +1,5 @@
+outs:
+- md5: f7daeb66384bfeb0d765e7cfc842ee1c.dir
+  size: 211029193578
+  nfiles: 44
+  path: raw_3d_audio
