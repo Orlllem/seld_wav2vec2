@@ -1,0 +1,37 @@
+stages:
+  unzip_pret_data:
+    cmd: python data_processing/pretraining/subprocess_unzip.py
+    deps:
+    - data/pre-training/raw_3d_audio
+    - data_processing/pretraining/unzip_pretraining_datasets.sh
+    - data_processing/pretraining/subprocess_unzip.py
+    params:
+    - unzip_pret_data
+    outs:
+    - ${unzip_pret_data.data_work_path}:
+          cache: false
+  
+  prepare_pret_dataset:
+    cmd: python data_processing/pretraining/pretraining_preprocess_data2X.py
+    deps:
+    - data/pre-training/raw_3d_audio
+    - data/pre-training/raw_3d_audio_data
+    - data_processing/pretraining/pretraining_preprocess_data2X.py
+    - data_processing/pretraining/utils.py
+    params:
+    - pret_dataset
+    outs:
+    - ${pret_dataset.save_path}:
+          cache: false
+
+  ft_dataset_tau2019:
+    cmd: python data_processing/fine-tuning/TAU_2019_preprocess_foa_xyz_cart_20msT.py
+    deps:
+    - data/pre-training/raw_3d_audio
+    - data/pre-training/raw_3d_audio_data
+    - data_processing/fine-tuning/TAU_2019_preprocess_foa_xyz_cart_20msT.py
+    - data_processing/fine-tuning/utils.py
+    params:
+    - ft_dataset_tau2019
+    outs:
+    - ${ft_dataset_tau2019.manifest_folder}
