@@ -1,0 +1,6 @@
+l3das: 22
+data_work_path: /work/olima/raw_3d_audio_data
+save_path: /work/olima/pret_l3das22_raw_ts4_str4
+fs_target: 16000
+window_in_s: 4
+stride_in_s: 4
