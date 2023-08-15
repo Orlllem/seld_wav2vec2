@@ -4,7 +4,9 @@ import os
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
+import numpy as np
 import torch
+from fairseq import metrics
 from fairseq.data.text_compressor import TextCompressionLevel
 from fairseq.dataclass import ChoiceEnum
 from fairseq.tasks import register_task
@@ -17,13 +19,25 @@ from torch_audiomentations import (AddColoredNoise, Compose, Gain,
 from torch_audiomentations.augmentations.spliceout import SpliceOut
 from torch_audiomentations.utils.object_dict import ObjectDict
 
+import seld_wav2vec2.criterions.cls_feature_class as cls_feature_class
+import seld_wav2vec2.criterions.parameter as parameter
+from seld_wav2vec2.criterions.evaluation_metrics import (
+    compute_doa_scores_regr_xyz, compute_sed_scores, early_stopping_metric,
+    er_overall_framewise, f1_overall_framewise)
+from seld_wav2vec2.criterions.SELD_evaluation_metrics import SELDMetrics
 from seld_wav2vec2.data import (AddTargetSeldAudioFrameClassDataset,
                                 AddTargetSeldSeqClassDataset, FileEventDataset)
 
 logger = logging.getLogger(__name__)
 
+# label frame resolution (label_frame_res)
+nb_label_frames_1s = 50  # 1/label_hop_len_s = 1/0.02
+nb_label_frames_1s_100ms = 10  # 1/label_hop_len_s = 1/0.1
+
+eps = np.finfo(np.float32).eps
 
 AUDIO_AUGM_MODES_CHOICES = ChoiceEnum(["per_example", "per_channel"])
+DCASE_CHOICES = ChoiceEnum(["2018", "2019", "2020"])
 
 
 class SpliceOutFilterShort(SpliceOut):
@@ -155,6 +169,7 @@ class SoundEventPretrainingTask(AudioPretrainingTask):
 
         manifest_path = os.path.join(data_path, "{}.tsv".format(split))
 
+        audio_transforms = None
         if self.cfg.audio_augm:
 
             assert all(
@@ -257,6 +272,29 @@ class SoundEventFinetuningConfig(SoundEventPretrainingConfig):
     shift_rollover: bool = field(
         default=True, metadata={"help": "rollover of shift"}
     )
+    eval_seld_score: bool = field(
+        default=True, metadata={"help": "evaluate the model with seld_score"}
+    )
+    optimize_threshold: bool = field(
+        default=True, metadata={"help": "optimize threshold during validation"}
+    )
+    doa_size: int = II("model.doa_size")
+    label_hop_len_s: float = field(
+        default=0.02,
+        metadata={
+            "help": "Label hop length in seconds"},
+    )
+    eval_dcase: DCASE_CHOICES = field(
+        default="2019", metadata={"help": "DCASE competition"}
+    )
+    opt_threshold_range: Tuple[float, float, float] = field(
+        default=(0.1, 1.0, 0.025),
+        metadata={
+            "help": (
+                "threshold range: min, max, step"
+            )
+        },
+    )
 
 
 @ register_task("sound_event_finetuning", dataclass=SoundEventFinetuningConfig)
@@ -270,6 +308,29 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
         cfg: SoundEventFinetuningConfig,
     ):
         super().__init__(cfg)
+
+        if self.cfg.eval_dcase == "2020":
+            params = parameter.get_params()
+
+            unique_classes = {}
+            for i in range(self.cfg.nb_classes):
+                unique_classes[i] = i
+
+            params['unique_classes'] = unique_classes
+            params['fs'] = self.cfg.sample_rate
+            params['label_hop_len_s'] = self.cfg.label_hop_len_s
+
+            self.feat_cls = cls_feature_class.FeatureClass(params)
+            self.cls_new_metric = SELDMetrics(nb_classes=self.cfg.nb_classes)
+
+        self.best_threshold = 0.5
+        self.best_score = None
+        self.valid_update = 0
+
+        self.class_probs_list = []
+        self.class_labels_list = []
+        self.reg_logits_list = []
+        self.reg_targets_list = []
 
     def load_dataset(
         self, split: str, task_cfg: SoundEventFinetuningConfig = None, **kwargs
@@ -395,3 +456,291 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
                 labels,
                 nb_classes=self.cfg.nb_classes,
             )
+
+    def reduce_metrics(self, logging_outputs, criterion):
+        super().reduce_metrics(logging_outputs, criterion)
+
+        if self.cfg.eval_seld_score and not criterion.training:
+
+            # validation step
+            class_probs = np.concatenate([log.get("class_probs", 0)
+                                          for log in logging_outputs], axis=0)
+            class_labels = np.concatenate([log.get("class_labels", 0)
+                                           for log in logging_outputs], axis=0)
+            reg_logits = np.concatenate([log.get("reg_logits", 0)
+                                         for log in logging_outputs], axis=0)
+            reg_targets = np.concatenate([log.get("reg_targets", 0)
+                                         for log in logging_outputs], axis=0)
+            sample_size = sum(log.get("sample_size", 0)
+                              for log in logging_outputs)
+
+            # cache batch predictions for validation
+            self.class_probs_list.append(class_probs)
+            self.class_labels_list.append(class_labels)
+            self.reg_logits_list.append(reg_logits)
+            self.reg_targets_list.append(reg_targets)
+
+            self.valid_update += sample_size
+
+            finished_valid = self.valid_update == len(self.datasets["valid"])
+
+            # apply when validation finished
+            if finished_valid:
+                if self.cfg.optimize_threshold:
+                    thr_list = [round(float(i), 3)
+                                for i in np.arange(*self.cfg.opt_threshold_range)]
+
+                    if self.cfg.eval_dcase != "2020":
+                        class_probs = np.concatenate(
+                            self.class_probs_list, axis=0)
+                        class_labels = np.concatenate(
+                            self.class_labels_list, axis=0)
+                        reg_logits = np.concatenate(
+                            self.reg_logits_list, axis=0)
+                        reg_targets = np.concatenate(
+                            self.reg_targets_list, axis=0)
+
+                        # class_probs.flags.writeable = False
+                        # class_labels.flags.writeable = False
+                        # reg_logits.flags.writeable = False
+                        # reg_targets.flags.writeable = False
+                    else:
+                        self.class_probs_list = tuple(self.class_probs_list)
+                        self.class_labels_list = tuple(self.class_labels_list)
+                        self.reg_logits_list = tuple(self.reg_logits_list)
+                        self.reg_targets_list = tuple(self.reg_targets_list)
+
+                    seld_score_list = []
+                    for thr_i in thr_list:
+                        if self.cfg.eval_dcase == "2020":
+
+                            for i in range(len(self.class_labels_list)):
+
+                                class_probs = self.class_probs_list[i].copy()
+                                class_labels = self.class_labels_list[i].copy()
+                                reg_logits = self.reg_logits_list[i].copy()
+                                reg_targets = self.reg_targets_list[i].copy()
+
+                                class_mask = class_probs > thr_i
+                                y_pred_class = class_mask.astype('float32')
+
+                                # ignore padded labels -100
+                                class_pad_mask = class_labels < 0
+                                class_labels[class_pad_mask] = 0
+                                y_true_class = class_labels.astype('float32')
+
+                                class_mask_extended = np.concatenate(
+                                    [class_mask]*self.cfg.doa_size, axis=-1)
+
+                                reg_logits[~class_mask_extended] = 0
+                                y_pred_reg = reg_logits.astype('float32')
+                                y_true_reg = reg_targets.astype('float32')
+
+                                self.eval_seld_score_2020(y_pred_reg,
+                                                          y_true_reg,
+                                                          y_pred_class,
+                                                          y_true_class)
+
+                            er, f, de, de_f = self.cls_new_metric.compute_seld_scores()
+                            seld_score_i = early_stopping_metric(
+                                [er, f], [de, de_f])
+
+                            seld_score_list.append(seld_score_i)
+
+                            # clear 2020 seld metrics
+                            self.cls_new_metric.reset_states()
+                        else:
+
+                            seld_score_i = self.compute_score_201X_for_thr(class_probs.copy(),
+                                                                           class_labels.copy(),
+                                                                           reg_logits.copy(),
+                                                                           reg_targets.copy(),
+                                                                           thr_i)
+
+                            seld_score_list.append(seld_score_i)
+
+                    seld_score_dict = dict(zip(thr_list, seld_score_list))
+
+                    # obtain the thresold with mininum seld score
+                    thr = min(seld_score_dict, key=seld_score_dict.get)
+
+                    # metrics.log_scalar("seld_score_default",
+                    #                   seld_score_dict[0.5], round=5)
+
+                    # set best threshold
+                    min_seld_score = np.min(seld_score_list)
+                    if self.best_score:
+                        if min_seld_score < self.best_score:
+                            self.best_threshold = thr
+                            self.best_score = min_seld_score
+                    else:
+                        self.best_threshold = thr
+                        self.best_score = min_seld_score
+
+                    logger.info(f"optimal threshold: {thr}")
+                    logger.info(f"min_seld_score: {min_seld_score}")
+                else:
+                    thr = 0.5
+                    min_seld_score = None
+
+                metrics.log_scalar("prob_threshold", thr, round=3)
+
+                if self.cfg.eval_dcase == "2020":
+                    for i in range(len(self.class_labels_list)):
+
+                        class_probs = self.class_probs_list[i]
+                        class_labels = self.class_labels_list[i]
+                        reg_logits = self.reg_logits_list[i]
+                        reg_targets = self.reg_targets_list[i]
+
+                        class_mask = class_probs > thr
+                        y_pred_class = class_mask.astype('float32')
+
+                        # ignore padded labels -100
+                        class_pad_mask = class_labels < 0
+                        class_labels[class_pad_mask] = 0
+                        y_true_class = class_labels.astype('float32')
+
+                        class_mask_extended = np.concatenate(
+                            [class_mask]*self.cfg.doa_size, axis=-1)
+
+                        reg_logits[~class_mask_extended] = 0
+                        y_pred_reg = reg_logits.astype('float32')
+                        y_true_reg = reg_targets.astype('float32')
+
+                        self.eval_seld_score_2020(y_pred_reg,
+                                                  y_true_reg,
+                                                  y_pred_class,
+                                                  y_true_class)
+
+                    er, f, de, de_f = self.cls_new_metric.compute_seld_scores()
+                    seld_score = early_stopping_metric(
+                        [er, f], [de, de_f])
+
+                    # clear 2020 seld metrics
+                    self.cls_new_metric.reset_states()
+                else:
+                    class_mask = class_probs > thr
+                    y_pred_class = class_mask.astype('float32')
+
+                    # ignore padded labels -100
+                    class_pad_mask = class_labels < 0
+                    class_labels[class_pad_mask] = 0
+                    y_true_class = class_labels.astype('float32')
+
+                    class_mask_extended = np.concatenate(
+                        [class_mask]*self.cfg.doa_size, axis=-1)
+
+                    reg_logits[~class_mask_extended] = 0
+                    y_pred_reg = reg_logits.astype('float32')
+                    y_true_reg = reg_targets.astype('float32')
+
+                    if self.cfg.eval_dcase == "2019":
+                        er, f, de, de_f, seld_score = self.eval_seld_score_2019(y_pred_reg,
+                                                                                y_true_reg,
+                                                                                y_pred_class,
+                                                                                y_true_class)
+                    else:
+                        # TAU - 2018
+                        er, f, de, de_f, seld_score = self.eval_seld_score_2018(y_pred_reg,
+                                                                                y_true_reg,
+                                                                                y_pred_class,
+                                                                                y_true_class)
+
+                if min_seld_score is not None:
+                    assert seld_score == min_seld_score, f"{seld_score} != {min_seld_score}"
+
+                metrics.log_scalar("f1_score", f * 100, round=5)
+                metrics.log_scalar("doa_error", de, round=5)
+                metrics.log_scalar(
+                    "frame_recall", de_f*100, round=5)
+                metrics.log_scalar(
+                    "error_rate", er*100, round=5)
+                metrics.log_scalar("seld_score", seld_score, round=5)
+
+                # reset states
+                self.valid_update = 0
+                self.class_probs_list = []
+                self.class_labels_list = []
+                self.reg_logits_list = []
+                self.reg_targets_list = []
+
+    def compute_score_201X_for_thr(self,
+                                   class_probs,
+                                   class_labels,
+                                   reg_logits,
+                                   reg_targets,
+                                   thr):
+
+        class_mask = class_probs > thr
+        y_pred_class = class_mask.astype('float32')
+
+        # ignore padded labels -100
+        class_pad_mask = class_labels < 0
+        class_labels[class_pad_mask] = 0
+        y_true_class = class_labels.astype('float32')
+
+        class_mask_extended = np.concatenate(
+            [class_mask]*self.cfg.doa_size, axis=-1)
+
+        reg_logits[~class_mask_extended] = 0
+        y_pred_reg = reg_logits.astype('float32')
+        y_true_reg = reg_targets.astype('float32')
+
+        if self.cfg.eval_dcase == "2019":
+            _, _, _, _, seld_score = self.eval_seld_score_2019(y_pred_reg,
+                                                               y_true_reg,
+                                                               y_pred_class,
+                                                               y_true_class)
+        else:
+            _, _, _, _, seld_score = self.eval_seld_score_2018(y_pred_reg,
+                                                               y_true_reg,
+                                                               y_pred_class,
+                                                               y_true_class)
+        return seld_score
+
+    def eval_seld_score_2018(self, doa_pred, doa_gt, sed_pred, sed_gt):
+
+        er_metric = compute_doa_scores_regr_xyz(doa_pred, doa_gt,
+                                                sed_pred, sed_gt)
+
+        _doa_err, _frame_recall, _, _, _, _ = er_metric
+        _er = er_overall_framewise(sed_pred, sed_gt)
+        _f = f1_overall_framewise(sed_pred, sed_gt)
+        _seld_scr = early_stopping_metric(
+            [_er, _f], [_doa_err, _frame_recall])
+
+        return _er, _f, _doa_err, _frame_recall, _seld_scr
+
+    def eval_seld_score_2019(self, doa_pred, doa_gt, sed_pred, sed_gt):
+
+        er_metric = compute_doa_scores_regr_xyz(
+            doa_pred, doa_gt, sed_pred, sed_gt)
+
+        _doa_err, _frame_recall, _, _, _, _ = er_metric
+        doa_metric = [_doa_err, _frame_recall]
+
+        sed_metric = compute_sed_scores(sed_pred, sed_gt, nb_label_frames_1s)
+        _er = sed_metric[0]
+        _f = sed_metric[1]
+
+        _seld_scr = early_stopping_metric(sed_metric, doa_metric)
+
+        return _er, _f, _doa_err, _frame_recall, _seld_scr
+
+    def eval_seld_score_2020(self, doa_pred, doa_gt, sed_pred, sed_gt):
+
+        pred_dict = self.feat_cls.regression_label_format_to_output_format(
+            sed_pred, doa_pred
+        )
+        gt_dict = self.feat_cls.regression_label_format_to_output_format(
+            sed_gt, doa_gt
+        )
+
+        pred_blocks_dict = self.feat_cls.segment_labels(
+            pred_dict, sed_pred.shape[0])
+        gt_blocks_dict = self.feat_cls.segment_labels(
+            gt_dict, sed_gt.shape[0])
+
+        self.cls_new_metric.update_seld_scores_xyz(
+            pred_blocks_dict, gt_blocks_dict)
