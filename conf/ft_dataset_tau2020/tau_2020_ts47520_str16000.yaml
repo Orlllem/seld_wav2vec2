@@ -1,0 +1,8 @@
+save_folder: data/fine-tuning/TAU_2020
+manifest_folder: data/fine-tuning/manifest/finetuning
+metadata_dev_path: data/pre-training/raw_3d_audio_data/TAU_2020/metadata_dev
+metadata_eval_path: data/pre-training/raw_3d_audio_data/TAU_2020/metadata_eval
+foa_dev_path: data/pre-training/raw_3d_audio_data/TAU_2020/foa_dev
+foa_eval_path: data/pre-training/raw_3d_audio_data/TAU_2020/foa_eval
+window_in_s: 2.97
+stride_in_s: 1.0
