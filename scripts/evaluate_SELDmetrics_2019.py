@@ -14,8 +14,8 @@ from torch.utils.data import DataLoader
 
 from seld_wav2vec2.criterions.evaluation_metrics import (
     compute_doa_scores_regr_xyz, compute_sed_scores, early_stopping_metric)
-from seld_wav2vec2.criterions.multi_label_regression import (
-    nb_label_frames_1s, reshape_3Dto2D)
+from seld_wav2vec2.criterions.multi_label_regression import reshape_3Dto2D
+from seld_wav2vec2.task.sound_event_finetuning import nb_label_frames_1s
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
