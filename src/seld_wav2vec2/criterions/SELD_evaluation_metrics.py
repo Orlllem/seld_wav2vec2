@@ -44,6 +44,25 @@ class SELDMetrics(object):
         self._spatial_T = doa_threshold
         self._nb_classes = nb_classes
 
+    def reset_states(self):
+        '''
+        Reset the internal attributes
+        '''
+        self._TP = 0
+        self._FP = 0
+        self._TN = 0
+        self._FN = 0
+
+        self._S = 0
+        self._D = 0
+        self._I = 0
+
+        self._Nref = 0
+        self._Nsys = 0
+
+        self._total_DE = 0
+        self._DE_TP = 0
+
     def compute_seld_scores(self):
         '''
         Collect the final SELD scores
