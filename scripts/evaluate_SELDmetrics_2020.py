@@ -27,7 +27,7 @@ logger = logging.getLogger("evaluate")
 
 
 def evaluate(ckpt_path, subset, batch_size, output_file_path, user_dir,
-             doa_size=3, label_hop_len_s=0.02):
+             doa_size=3, label_hop_len_s=0.02, data=None, thr=0.5):
 
     Arg = namedtuple("Arg", ["user_dir"])
     arg = Arg(user_dir.__str__())
@@ -36,6 +36,9 @@ def evaluate(ckpt_path, subset, batch_size, output_file_path, user_dir,
     models, _, task = checkpoint_utils.load_model_ensemble_and_task([
                                                                     ckpt_path])
     model = models[0].eval().cuda()
+
+    if data is not None:
+        task.cfg.data = data
 
     model.w2v_encoder.apply_mask = False
     task.cfg.audio_augm = False
@@ -66,7 +69,7 @@ def evaluate(ckpt_path, subset, batch_size, output_file_path, user_dir,
 
             class_probs = torch.sigmoid(class_logits.float())
 
-            class_mask = class_probs > 0.5
+            class_mask = class_probs > thr
 
             class_preds = class_mask.float()
 
@@ -159,7 +162,20 @@ if __name__ == "__main__":
                         default=3,
                         type=int,
                         help='Size of DOA.')
+    parser.add_argument('--label_hop_len_s',
+                        default=0.02,
+                        type=float,
+                        help='Hop len of labels')
+    parser.add_argument('--data',
+                        type=str,
+                        help=("path and name of output metrics file."))
+    parser.add_argument('--threshold',
+                        default=0.5,
+                        type=float,
+                        help='Size of DOA.')
 
     args = parser.parse_args()
     evaluate(args.ckpt_path, args.subset, args.batch_size,
-             args.output_file_path, args.user_dir, args.doa_size)
+             args.output_file_path, args.user_dir, doa_size=args.doa_size,
+             label_hop_len_s=args.label_hop_len_s,
+             data=args.data, thr=args.threshold)
