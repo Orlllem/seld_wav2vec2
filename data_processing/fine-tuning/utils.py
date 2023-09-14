@@ -135,9 +135,13 @@ def remove_overlap_same_class(df):
 
             if len(df_frames_sub["sound_event_recording"].unique()) == 1:
 
-                assert len(df_frames_sub) == 2
-
-                index_to_remove.append(df_frames_sub.index.tolist()[-1])
+                if len(df_frames_sub) == 2:
+                    assert len(df_frames_sub) == 2
+                    index_to_remove.append(df_frames_sub.index.tolist()[-1])
+                else:
+                    assert len(df_frames_sub) == 3
+                    index_to_remove.append(df_frames_sub.index.tolist()[-1])
+                    index_to_remove.append(df_frames_sub.index.tolist()[-2])
 
     index_to_remove = list(set(index_to_remove))
 
