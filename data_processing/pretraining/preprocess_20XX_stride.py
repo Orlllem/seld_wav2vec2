@@ -1,5 +1,6 @@
 
 
+import gc
 import glob
 import logging
 import os
@@ -169,3 +170,5 @@ def preprocess_audio_waves(ds_tag,
                                         recursive=True)
 
         logger.info(f"saved {len(saved_foa_wav_files)} .wav files")
+
+        gc.collect()
