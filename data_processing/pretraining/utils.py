@@ -1,5 +1,6 @@
 
 
+import gc
 import logging
 import os
 import sys
@@ -63,3 +64,7 @@ def save_wav_for_dataset(ds_wav_files, save_path, ds_name, slide_win,
 
             torchaudio.save(save_filename, wav_arr, sample_rate=sample_rate,
                             bits_per_sample=16, encoding='PCM_S')
+
+        # save memory
+        del wav_arr, wav_proc, wav
+        gc.collect()
