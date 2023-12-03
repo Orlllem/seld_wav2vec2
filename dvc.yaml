@@ -14,12 +14,12 @@ stages:
   prepare_pret_dataset:
     cmd: python data_processing/pretraining/pretraining_preprocess_data2X.py
     deps:
+    - conf/pret_dataset/raw_audio_l3das21_ts4_str4.yaml
+    - conf/config.yaml
     - data/pre-training/raw_3d_audio
     - data/pre-training/raw_3d_audio_data
     - data_processing/pretraining/pretraining_preprocess_data2X.py
     - data_processing/pretraining/utils.py
-    params:
-    - pret_dataset
     outs:
     - ${pret_dataset.save_path}:
           cache: false
@@ -27,11 +27,23 @@ stages:
   ft_dataset_tau2019:
     cmd: python data_processing/fine-tuning/TAU_2019_preprocess_foa_xyz_cart_20msT.py
     deps:
+    - conf/ft_dataset_tau2019/tau_2019_ts47520_str10000.yaml
+    - conf/config.yaml
     - data/pre-training/raw_3d_audio
     - data/pre-training/raw_3d_audio_data
     - data_processing/fine-tuning/TAU_2019_preprocess_foa_xyz_cart_20msT.py
     - data_processing/fine-tuning/utils.py
-    params:
-    - ft_dataset_tau2019
     outs:
     - ${ft_dataset_tau2019.manifest_folder}
+  
+  ft_dataset_tau2020:
+    cmd: python data_processing/fine-tuning/TAU_2020_preprocess_foa_xyz_cart_20msT.py
+    deps:
+    - conf/ft_dataset_tau2020/tau_2020_ts47520_str10000.yaml
+    - conf/config.yaml
+    - data/pre-training/raw_3d_audio
+    - data/pre-training/raw_3d_audio_data
+    - data_processing/fine-tuning/TAU_2020_preprocess_foa_xyz_cart_20msT.py
+    - data_processing/fine-tuning/utils.py
+    outs:
+    - ${ft_dataset_tau2020.manifest_folder}
