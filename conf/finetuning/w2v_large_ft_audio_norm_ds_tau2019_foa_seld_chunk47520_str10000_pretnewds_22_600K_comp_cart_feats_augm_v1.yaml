@@ -1,0 +1,121 @@
+common:
+  fp16: true
+  fp16_no_flatten_grads: true
+  log_format: json
+  log_interval: 200
+  wandb_project: wav2vec-seld-ft
+
+checkpoint:
+  no_epoch_checkpoints: true
+  best_checkpoint_metric: seld_score
+  save_dir: seld_ckpts_results/large_audio_frame/tau2019/foa/w2v/w2v_pret_ts_4s_str_4_600K_v1/w2v_large_ft_audio_pret_norm_ds_tau2019_foa_chunk47520_str10000_comp_cart_feats_doa_augm_emb_250k_v1
+  patience: 100
+
+task:
+  _name: sound_event_finetuning
+  sample_rate: 16000
+  enable_padding: true
+  max_sample_size: 100000
+  data: ???
+  normalize: true
+  audio_augm: true
+  params_augm: [2.0, 0.3, 3, 30, 0.5]
+  random_crop: true
+  rnd_crop_valid: false
+  labels: json
+  seld_audio_frame_class: true
+  doa_swap_prob: 0.5
+  shift_prob: 0.0
+  eval_dcase: "2019"
+
+dataset:
+  num_workers: 1
+  max_tokens: 2000000
+  skip_invalid_size_inputs_valid_test: true
+  valid_subset: valid
+
+distributed_training:
+  ddp_backend: legacy_ddp
+  distributed_world_size: 1
+
+criterion:
+  _name: multitask_sed_doa_audio_frame_class_cart_dcase
+  report_accuracy: true
+  loss_weights: [1.0, 1000.0]
+  extend_mask: false
+
+optimization:
+  max_update: 250000
+  lr: [0.0]
+  sentence_avg: true
+  update_freq: [1]
+  clip_norm: 10.0
+
+optimizer:
+  _name: composite
+  groups:
+   w2v_model:
+    lr: [5e-5]
+    lr_float: null
+    optimizer:
+     _name: adam
+     adam_betas: (0.9,0.98)
+     adam_eps: 1e-08
+     weight_decay: 0.001
+    lr_scheduler:
+     _name: tri_stage
+     phase_ratio: [0.1, 0.3, 0.6]
+     final_lr_scale: 0.05 
+   classifier_head:
+    lr: [5e-4]
+    lr_float: null
+    optimizer:
+     _name: adam
+     adam_betas: (0.9,0.98)
+     adam_eps: 1e-08
+     weight_decay: 0.001
+    lr_scheduler:
+     _name: tri_stage
+     phase_ratio: [0.1, 0.3, 0.6]
+     final_lr_scale: 0.05 
+   regression_head:
+    lr: [5e-4]
+    lr_float: null
+    optimizer:
+     _name: adam
+     adam_betas: (0.9,0.98)
+     adam_eps: 1e-08
+     weight_decay: 0.001
+    lr_scheduler:
+     _name: tri_stage
+     phase_ratio: [0.1, 0.3, 0.6]
+     final_lr_scale: 0.05
+   
+lr_scheduler: pass_through
+
+model:
+  _name: wav2vec2_seld_audio_frame_class
+  w2v_path: ???
+  ignore_mismatched_sizes: false
+  in_channels: 4
+  in_conv_groups: 1
+  target_length: 11
+  doa_size: 3
+  n_trans_layers_to_freeze: 0
+  classifier_input_dropout: 0.1
+  regression_input_dropout: 0.1
+  classifier_proj_size: 1024
+  regression_proj_size: 1024
+  classifier_activation_fn: gelu
+  regression_activation_fn: gelu
+  classifier_dropout: 0.5
+  regression_dropout: 0.5
+  apply_mask: true
+  mask_prob: 0.5
+  mask_length: 10
+  mask_channel_prob: 0.1
+  mask_channel_length: 64
+  layerdrop: 0.1
+  activation_dropout: 0.1
+  feature_grad_mult: 1.0
+  freeze_finetune_updates: 10000
