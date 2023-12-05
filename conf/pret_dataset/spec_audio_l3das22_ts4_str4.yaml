@@ -1,0 +1,11 @@
+l3das: 22
+data_work_path: data/pre-training/raw_3d_audio_data
+save_path: data/pre-training/pret_l3das22_ts4_str4_spec
+fs_target: 16000
+window_in_s: 4
+stride_in_s: 4
+spec_extractor:
+  spectrogram_1d: false
+  n_mels: 64
+  hop_len_s: 0.005
+  gammatone_filter_banks: false
