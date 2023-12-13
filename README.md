@@ -194,15 +194,23 @@ The ```config-name``` represent the .yaml experiments that are in ```conf/finetu
 seld_wav2vec2(-py) is MIT-licensed.
 The license applies to the pre-trained models as well.
 
+
+# Paper Arxiv
+
+
+[w2v-SELD: A Sound Event Localization and Detection Framework for Self-Supervised Spatial Audio Pre-Training](http://arxiv.org/abs/2312.06907)
+
 # Citation
 
 Please cite as:
 
 ``` bibtex
-@inproceedings{olima2023w2v2seld,
-  title = {w2v-SELD: A Sound Events Localization and Detection (SELD) Framework for Self-Supervised Spatial Audio Pre-Training},
-  author = {Orlem Lima dos Santos, Karen Rosero and Roberto de Alencar Lotufo},
-  booktitle = {arxiv},
-  year = {2023},
+@misc{santos2023w2vseld,
+      title={w2v-SELD: A Sound Event Localization and Detection Framework for Self-Supervised Spatial Audio Pre-Training}, 
+      author={Orlem Lima dos Santos and Karen Rosero and Roberto de Alencar Lotufo},
+      year={2023},
+      eprint={2312.06907},
+      archivePrefix={arXiv},
+      primaryClass={eess.AS}
 }
 ```
