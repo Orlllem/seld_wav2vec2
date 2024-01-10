@@ -10,10 +10,16 @@ from fairseq import checkpoint_utils, tasks, utils
 from fairseq.dataclass.utils import convert_namespace_to_omegaconf
 from fairseq.models import BaseFairseqModel, FairseqEncoder, register_model
 from fairseq.models.lstm import DEFAULT_MAX_SOURCE_POSITIONS, LSTMEncoder
-from fairseq.models.wav2vec.wav2vec2 import (EXTRACTOR_MODE_CHOICES,
-                                             ConformerEncoder, Wav2Vec2Config)
-from fairseq.models.wav2vec.wav2vec2_asr import (Wav2Vec2AsrConfig, Wav2VecCtc,
-                                                 Wav2VecEncoder)
+from fairseq.models.wav2vec.wav2vec2 import (
+    EXTRACTOR_MODE_CHOICES,
+    ConformerEncoder,
+    Wav2Vec2Config,
+)
+from fairseq.models.wav2vec.wav2vec2_asr import (
+    Wav2Vec2AsrConfig,
+    Wav2VecCtc,
+    Wav2VecEncoder,
+)
 from fairseq.modules import LayerNorm
 from fairseq.tasks import FairseqTask
 from omegaconf import open_dict
@@ -24,9 +30,7 @@ from seld_wav2vec2.model.utils import get_activation_fn
 
 
 class DummyDictionary:
-    def __init__(
-        self, vocab_size
-    ):
+    def __init__(self, vocab_size):
         self.vocab_len = vocab_size
         self.symbols = []
         for i in range(self.vocab_len):
@@ -56,8 +60,7 @@ def _mean_pooling(enc_feats, src_masks):
     else:
         src_masks = (~src_masks).transpose(0, 1).type_as(enc_feats)
         enc_feats = (
-            (enc_feats / src_masks.sum(0)
-             [None, :, None]) * src_masks[:, :, None]
+            (enc_feats / src_masks.sum(0)[None, :, None]) * src_masks[:, :, None]
         ).sum(0)
     return enc_feats
 
@@ -85,17 +88,19 @@ class LSTMEncoder3D(LSTMEncoder):
         padding_idx=None,
         max_source_positions=DEFAULT_MAX_SOURCE_POSITIONS,
     ):
-        super().__init__(dictionary,
-                         embed_dim=embed_dim,
-                         hidden_size=hidden_size,
-                         num_layers=num_layers,
-                         dropout_in=dropout_in,
-                         dropout_out=dropout_out,
-                         bidirectional=bidirectional,
-                         left_pad=left_pad,
-                         pretrained_embed=pretrained_embed,
-                         padding_idx=padding_idx,
-                         max_source_positions=max_source_positions)
+        super().__init__(
+            dictionary,
+            embed_dim=embed_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout_in=dropout_in,
+            dropout_out=dropout_out,
+            bidirectional=bidirectional,
+            left_pad=left_pad,
+            pretrained_embed=pretrained_embed,
+            padding_idx=padding_idx,
+            max_source_positions=max_source_positions,
+        )
 
     def forward(
         self,
@@ -144,8 +149,7 @@ class LSTMEncoder3D(LSTMEncoder):
             state_size = self.num_layers, bsz, self.hidden_size
         h0 = x.new_zeros(*state_size)
         c0 = x.new_zeros(*state_size)
-        packed_outs, (final_hiddens, final_cells) = self.lstm(
-            packed_x, (h0, c0))
+        packed_outs, (final_hiddens, final_cells) = self.lstm(packed_x, (h0, c0))
 
         # unpack outputs and apply dropout
         x, _ = nn.utils.rnn.pad_packed_sequence(
@@ -191,19 +195,18 @@ class Wav2Vec2SeldClassConfig(Wav2Vec2SeldConfig):
     n_trans_layers_to_freeze: int = field(
         default=0,
         metadata={
-            "help": ("number of layers to freeze in the pretrained transformer"
-                     "model")
+            "help": ("number of layers to freeze in the pretrained transformer" "model")
         },
     )
     classifier_activation_fn: str = field(
         default="tanh",
-        metadata={
-            "help": " activation function of pooler"
-        },
+        metadata={"help": " activation function of pooler"},
     )
     classifier_input_dropout: float = field(
-        default=0.0, metadata={"help": "dropout of pooler in ClassifierHead"
-                               "applied to input features"}
+        default=0.0,
+        metadata={
+            "help": "dropout of pooler in ClassifierHead" "applied to input features"
+        },
     )
     classifier_dropout: float = field(
         default=0.0, metadata={"help": "dropout of dense in ClassifierHead"}
@@ -215,12 +218,15 @@ class Wav2Vec2SeldClassConfig(Wav2Vec2SeldConfig):
         default=768, metadata={"help": "inner_dim in ClassifierHead"}
     )
     proj_before_pooler: bool = field(
-        default=False, metadata={"help": "whether to project before of after"
-                                 "mean-pooling in ClassifierHead"}
+        default=False,
+        metadata={
+            "help": "whether to project before of after"
+            "mean-pooling in ClassifierHead"
+        },
     )
 
 
-@ dataclass
+@dataclass
 class Wav2Vec2SeldSeqClassConfig(Wav2Vec2SeldClassConfig):
     pass
 
@@ -229,9 +235,7 @@ class Wav2Vec2SeldSeqClassConfig(Wav2Vec2SeldClassConfig):
 class Wav2Vec2SeldSequeceClassConfig(Wav2Vec2SeldClassConfig):
     regression_activation_fn: str = field(
         default="tanh",
-        metadata={
-            "help": " activation function of pooler"
-        },
+        metadata={"help": " activation function of pooler"},
     )
     regression_proj_size: int = field(
         default=768, metadata={"help": "inner_dim in ClassifierHead"}
@@ -247,7 +251,7 @@ class Wav2Vec2SeldSequeceClassConfig(Wav2Vec2SeldClassConfig):
     )
 
 
-@ dataclass
+@dataclass
 class Wav2Vec2SeqSeldSequeceClassConfig(Wav2Vec2SeldSequeceClassConfig):
     pass
 
@@ -257,8 +261,7 @@ class Wav2Vec2SeldAudioFrameClassConfig(Wav2Vec2SeldConfig):
     n_trans_layers_to_freeze: int = field(
         default=0,
         metadata={
-            "help": ("number of layers to freeze in the pretrained transformer"
-                     "model")
+            "help": ("number of layers to freeze in the pretrained transformer model")
         },
     )
     layer_norm_first: bool = field(
@@ -266,13 +269,11 @@ class Wav2Vec2SeldAudioFrameClassConfig(Wav2Vec2SeldConfig):
     )
     classifier_activation_fn: str = field(
         default="tanh",
-        metadata={
-            "help": " activation function of head"
-        },
+        metadata={"help": " activation function of head"},
     )
     classifier_input_dropout: float = field(
-        default=0.0, metadata={"help": "dropout of in ClassifierHead"
-                               "applied to input features"}
+        default=0.0,
+        metadata={"help": "dropout of in ClassifierHead applied to input features"},
     )
     classifier_dropout: float = field(
         default=0.0, metadata={"help": "dropout of dense in ClassifierHead"}
@@ -281,23 +282,19 @@ class Wav2Vec2SeldAudioFrameClassConfig(Wav2Vec2SeldConfig):
         default=11, metadata={"help": "number of targets in classification"}
     )
     classifier_proj_size: Any = field(
-        default=768,
-        metadata={"help": "inner dimensions of classifier"})
+        default=768, metadata={"help": "inner dimensions of classifier"}
+    )
     regression_activation_fn: str = field(
         default="tanh",
-        metadata={
-            "help": " activation function of regression inner"
-        },
+        metadata={"help": " activation function of regression inner"},
     )
     regression_out_activation_fn: str = field(
         default="linear",
-        metadata={
-            "help": " activation function of regression output"
-        },
+        metadata={"help": " activation function of regression output"},
     )
     regression_proj_size: Any = field(
-        default=768,
-        metadata={"help": "inner dimensions of regression"})
+        default=768, metadata={"help": "inner dimensions of regression"}
+    )
     regression_input_dropout: float = field(
         default=0.0, metadata={"help": "dropout of proj in RegressionHead"}
     )
@@ -307,9 +304,10 @@ class Wav2Vec2SeldAudioFrameClassConfig(Wav2Vec2SeldConfig):
     doa_size: int = field(
         default=3, metadata={"help": "number of DOA in RegressionHead"}
     )
+    grad_norm: bool = field(default=False, metadata={"help": "apply gradnorm to model"})
 
 
-@ dataclass
+@dataclass
 class Wav2Vec2SeqSeldAudioFrameClassConfig(Wav2Vec2SeldAudioFrameClassConfig):
     pass
 
@@ -319,16 +317,15 @@ class Wav2Vec2SeldAudioFrameClassTCNConfig(Wav2Vec2SeldConfig):
     n_trans_layers_to_freeze: int = field(
         default=0,
         metadata={
-            "help": ("number of layers to freeze in the pretrained transformer"
-                     "model")
+            "help": ("number of layers to freeze in the pretrained transformer model")
         },
     )
     classifier_inner_channels: Tuple[int, ...] = field(
-        default=(100, 100),
-        metadata={"help": "inner dimensions of TCN classifier"})
+        default=(100, 100), metadata={"help": "inner dimensions of TCN classifier"}
+    )
     classifier_input_dropout: float = field(
-        default=0.0, metadata={"help": "dropout of in ClassifierHead"
-                               "applied to input features"}
+        default=0.0,
+        metadata={"help": "dropout of in ClassifierHead applied to input features"},
     )
     classifier_dropout: float = field(
         default=0.0, metadata={"help": "dropout of dense in ClassifierHead"}
@@ -341,19 +338,15 @@ class Wav2Vec2SeldAudioFrameClassTCNConfig(Wav2Vec2SeldConfig):
     )
     classifier_norm_mode: EXTRACTOR_MODE_CHOICES = field(
         default="default",
-        metadata={
-            "help": "norm type used in block"
-        },
+        metadata={"help": "norm type used in block"},
     )
     classifier_activation_fn: str = field(
         default="relu",
-        metadata={
-            "help": " activation function of head"
-        },
+        metadata={"help": " activation function of head"},
     )
     regression_inner_channels: Tuple[int, ...] = field(
-        default=(100, 100),
-        metadata={"help": "inner dimensions of TCN regression"})
+        default=(100, 100), metadata={"help": "inner dimensions of TCN regression"}
+    )
     regression_input_dropout: float = field(
         default=0.0, metadata={"help": "dropout of proj in RegressionHead"}
     )
@@ -365,22 +358,18 @@ class Wav2Vec2SeldAudioFrameClassTCNConfig(Wav2Vec2SeldConfig):
     )
     regression_norm_mode: EXTRACTOR_MODE_CHOICES = field(
         default="default",
-        metadata={
-            "help": "norm type used in block"
-        },
+        metadata={"help": "norm type used in block"},
     )
     regression_activation_fn: str = field(
         default="relu",
-        metadata={
-            "help": " activation function of regression inner"
-        },
+        metadata={"help": " activation function of regression inner"},
     )
     doa_size: int = field(
         default=3, metadata={"help": "number of DOA in RegressionHead"}
     )
 
 
-@ dataclass
+@dataclass
 class Wav2Vec2SeqSeldAudioFrameClassTCNConfig(Wav2Vec2SeldAudioFrameClassTCNConfig):
     pass
 
@@ -413,7 +402,7 @@ class Wav2Vec2SeldAudioFrameClassLSTMConfig(Wav2Vec2SeldAudioFrameClassConfig):
     )
 
 
-@ dataclass
+@dataclass
 class Wav2Vec2SeqSeldAudioFrameClassLSTMConfig(Wav2Vec2SeldAudioFrameClassLSTMConfig):
     pass
 
@@ -423,13 +412,12 @@ class Wav2Vec2SeldAudioFrameClassConformerConfig(Wav2Vec2SeldConfig):
     n_trans_layers_to_freeze: int = field(
         default=0,
         metadata={
-            "help": ("number of layers to freeze in the pretrained transformer"
-                     "model")
+            "help": ("number of layers to freeze in the pretrained transformer model")
         },
     )
     classifier_input_dropout: float = field(
-        default=0.0, metadata={"help": "dropout of in ClassifierHead"
-                               "applied to input features"}
+        default=0.0,
+        metadata={"help": "dropout of in ClassifierHead applied to input features"},
     )
     classifier_encoder: Wav2Vec2Config = Wav2Vec2Config()
     regression_encoder: Wav2Vec2Config = Wav2Vec2Config()
@@ -444,8 +432,10 @@ class Wav2Vec2SeldAudioFrameClassConformerConfig(Wav2Vec2SeldConfig):
     )
 
 
-@ dataclass
-class Wav2Vec2SeqSeldAudioFrameClassConformerConfig(Wav2Vec2SeldAudioFrameClassConformerConfig):
+@dataclass
+class Wav2Vec2SeqSeldAudioFrameClassConformerConfig(
+    Wav2Vec2SeldAudioFrameClassConformerConfig
+):
     pass
 
 
@@ -454,8 +444,7 @@ class Wav2Vec2SeldAccDoaAudioFrameClassConfig(Wav2Vec2SeldConfig):
     n_trans_layers_to_freeze: int = field(
         default=0,
         metadata={
-            "help": ("number of layers to freeze in the pretrained transformer"
-                     "model")
+            "help": ("number of layers to freeze in the pretrained transformer model")
         },
     )
     layer_norm_first: bool = field(
@@ -466,9 +455,7 @@ class Wav2Vec2SeldAccDoaAudioFrameClassConfig(Wav2Vec2SeldConfig):
     )
     regression_activation_fn: str = field(
         default="tanh",
-        metadata={
-            "help": " activation function of pooler"
-        },
+        metadata={"help": " activation function of pooler"},
     )
     regression_proj_size: int = field(
         default=768, metadata={"help": "inner_dim in ClassifierHead"}
@@ -484,15 +471,16 @@ class Wav2Vec2SeldAccDoaAudioFrameClassConfig(Wav2Vec2SeldConfig):
     )
 
 
-@ dataclass
-class Wav2Vec2SeqSeldAccDoaAudioFrameClassConfig(Wav2Vec2SeldAccDoaAudioFrameClassConfig):
+@dataclass
+class Wav2Vec2SeqSeldAccDoaAudioFrameClassConfig(
+    Wav2Vec2SeldAccDoaAudioFrameClassConfig
+):
     pass
 
 
 @register_model("wav2vec2_class", dataclass=Wav2Vec2SeldSeqClassConfig)
 class Wav2vecSeqClass(Wav2VecCtc):
-    def __init__(self, cfg: Wav2Vec2SeldSeqClassConfig,
-                 w2v_encoder: BaseFairseqModel):
+    def __init__(self, cfg: Wav2Vec2SeldSeqClassConfig, w2v_encoder: BaseFairseqModel):
         BaseFairseqModel.__init__(self)
         self.cfg = cfg
         self.w2v_encoder = w2v_encoder
@@ -512,98 +500,121 @@ class Wav2vecSeqClass(Wav2VecCtc):
         return sample["target"].long()
 
 
-@register_model("wav2vec2_seld_sequence_class",
-                dataclass=Wav2Vec2SeqSeldSequeceClassConfig)
+@register_model(
+    "wav2vec2_seld_sequence_class", dataclass=Wav2Vec2SeqSeldSequeceClassConfig
+)
 class Wav2vec2SeqSeldSequenceClassEncoder(Wav2vecSeqClass):
-    def __init__(self, cfg: Wav2Vec2SeqSeldSequeceClassConfig,
-                 w2v_encoder: BaseFairseqModel):
+    def __init__(
+        self, cfg: Wav2Vec2SeqSeldSequeceClassConfig, w2v_encoder: BaseFairseqModel
+    ):
         super().__init__(cfg, w2v_encoder)
 
     @classmethod
-    def build_model(cls, cfg: Wav2Vec2SeqSeldSequeceClassConfig,
-                    task: FairseqTask):
+    def build_model(cls, cfg: Wav2Vec2SeqSeldSequeceClassConfig, task: FairseqTask):
         """Build a new model instance."""
         w2v_encoder = Wav2vec2SeldSequenceClassEncoder(cfg, cfg.target_length)
         return cls(cfg, w2v_encoder)
 
 
-@register_model("wav2vec2_seld_audio_frame_class",
-                dataclass=Wav2Vec2SeqSeldAudioFrameClassConfig)
+@register_model(
+    "wav2vec2_seld_audio_frame_class", dataclass=Wav2Vec2SeqSeldAudioFrameClassConfig
+)
 class Wav2vec2SeqSeldAudioFrameClassEncoder(Wav2vecSeqClass):
-    def __init__(self, cfg: Wav2Vec2SeqSeldAudioFrameClassConfig,
-                 w2v_encoder: BaseFairseqModel):
+    def __init__(
+        self, cfg: Wav2Vec2SeqSeldAudioFrameClassConfig, w2v_encoder: BaseFairseqModel
+    ):
         super().__init__(cfg, w2v_encoder)
 
     @classmethod
-    def build_model(cls, cfg: Wav2Vec2SeqSeldAudioFrameClassConfig,
-                    task: FairseqTask):
+    def build_model(cls, cfg: Wav2Vec2SeqSeldAudioFrameClassConfig, task: FairseqTask):
         """Build a new model instance."""
-        w2v_encoder = Wav2vec2SeldAudioFrameClassEncoder(
-            cfg, cfg.target_length)
+        w2v_encoder = Wav2vec2SeldAudioFrameClassEncoder(cfg, cfg.target_length)
         return cls(cfg, w2v_encoder)
 
 
-@register_model("wav2vec2_seld_audio_frame_class_tcn",
-                dataclass=Wav2Vec2SeqSeldAudioFrameClassTCNConfig)
+@register_model(
+    "wav2vec2_seld_audio_frame_class_tcn",
+    dataclass=Wav2Vec2SeqSeldAudioFrameClassTCNConfig,
+)
 class Wav2vec2SeqSeldAudioFrameClassTCNEncoder(Wav2vecSeqClass):
-    def __init__(self, cfg: Wav2Vec2SeqSeldAudioFrameClassTCNConfig,
-                 w2v_encoder: BaseFairseqModel):
+    def __init__(
+        self,
+        cfg: Wav2Vec2SeqSeldAudioFrameClassTCNConfig,
+        w2v_encoder: BaseFairseqModel,
+    ):
         super().__init__(cfg, w2v_encoder)
 
     @classmethod
-    def build_model(cls, cfg: Wav2Vec2SeqSeldAudioFrameClassTCNConfig,
-                    task: FairseqTask):
+    def build_model(
+        cls, cfg: Wav2Vec2SeqSeldAudioFrameClassTCNConfig, task: FairseqTask
+    ):
         """Build a new model instance."""
-        w2v_encoder = Wav2vec2SeldAudioFrameClassTCNEncoder(
-            cfg, cfg.target_length)
+        w2v_encoder = Wav2vec2SeldAudioFrameClassTCNEncoder(cfg, cfg.target_length)
         return cls(cfg, w2v_encoder)
 
 
-@register_model("wav2vec2_seld_audio_frame_class_lstm",
-                dataclass=Wav2Vec2SeqSeldAudioFrameClassLSTMConfig)
+@register_model(
+    "wav2vec2_seld_audio_frame_class_lstm",
+    dataclass=Wav2Vec2SeqSeldAudioFrameClassLSTMConfig,
+)
 class Wav2vec2SeqSeldAudioFrameClassLSTMEncoder(Wav2vecSeqClass):
-    def __init__(self, cfg: Wav2Vec2SeqSeldAudioFrameClassLSTMConfig,
-                 w2v_encoder: BaseFairseqModel):
+    def __init__(
+        self,
+        cfg: Wav2Vec2SeqSeldAudioFrameClassLSTMConfig,
+        w2v_encoder: BaseFairseqModel,
+    ):
         super().__init__(cfg, w2v_encoder)
 
     @classmethod
-    def build_model(cls, cfg: Wav2Vec2SeqSeldAudioFrameClassLSTMConfig,
-                    task: FairseqTask):
+    def build_model(
+        cls, cfg: Wav2Vec2SeqSeldAudioFrameClassLSTMConfig, task: FairseqTask
+    ):
         """Build a new model instance."""
-        w2v_encoder = Wav2vec2SeldAudioFrameClassLSTMEncoder(
-            cfg, cfg.target_length)
+        w2v_encoder = Wav2vec2SeldAudioFrameClassLSTMEncoder(cfg, cfg.target_length)
         return cls(cfg, w2v_encoder)
 
 
-@register_model("wav2vec2_seld_audio_frame_class_conformer",
-                dataclass=Wav2Vec2SeqSeldAudioFrameClassConformerConfig)
+@register_model(
+    "wav2vec2_seld_audio_frame_class_conformer",
+    dataclass=Wav2Vec2SeqSeldAudioFrameClassConformerConfig,
+)
 class Wav2vec2SeqSeldAudioFrameClassConformerEncoder(Wav2vecSeqClass):
-    def __init__(self, cfg: Wav2Vec2SeqSeldAudioFrameClassConformerConfig,
-                 w2v_encoder: BaseFairseqModel):
+    def __init__(
+        self,
+        cfg: Wav2Vec2SeqSeldAudioFrameClassConformerConfig,
+        w2v_encoder: BaseFairseqModel,
+    ):
         super().__init__(cfg, w2v_encoder)
 
     @classmethod
-    def build_model(cls, cfg: Wav2Vec2SeqSeldAudioFrameClassConformerConfig,
-                    task: FairseqTask):
+    def build_model(
+        cls, cfg: Wav2Vec2SeqSeldAudioFrameClassConformerConfig, task: FairseqTask
+    ):
         """Build a new model instance."""
         w2v_encoder = Wav2vec2SeldAudioFrameClassConformerEncoder(
-            cfg, cfg.target_length)
+            cfg, cfg.target_length
+        )
         return cls(cfg, w2v_encoder)
 
 
-@register_model("wav2vec2_seld_accdoa_audio_frame_class",
-                dataclass=Wav2Vec2SeqSeldAccDoaAudioFrameClassConfig)
+@register_model(
+    "wav2vec2_seld_accdoa_audio_frame_class",
+    dataclass=Wav2Vec2SeqSeldAccDoaAudioFrameClassConfig,
+)
 class Wav2vec2SeqSeldAccDoaAudioFrameClassEncoder(Wav2vecSeqClass):
-    def __init__(self, cfg: Wav2Vec2SeqSeldAccDoaAudioFrameClassConfig,
-                 w2v_encoder: BaseFairseqModel):
+    def __init__(
+        self,
+        cfg: Wav2Vec2SeqSeldAccDoaAudioFrameClassConfig,
+        w2v_encoder: BaseFairseqModel,
+    ):
         super().__init__(cfg, w2v_encoder)
 
     @classmethod
-    def build_model(cls, cfg: Wav2Vec2SeqSeldAccDoaAudioFrameClassConfig,
-                    task: FairseqTask):
+    def build_model(
+        cls, cfg: Wav2Vec2SeqSeldAccDoaAudioFrameClassConfig, task: FairseqTask
+    ):
         """Build a new model instance."""
-        w2v_encoder = Wav2vec2SeldAccDoaAudioFrameClassEncoder(
-            cfg, cfg.target_length)
+        w2v_encoder = Wav2vec2SeldAccDoaAudioFrameClassEncoder(cfg, cfg.target_length)
         return cls(cfg, w2v_encoder)
 
 
@@ -642,7 +653,6 @@ class Wav2vec2SeqClassHead(nn.Module):
             self.out_proj = torch.nn.Linear(inner_dim, num_outs)
 
     def forward(self, features, padding_mask, **kwargs):
-
         x = self.dropout(features)
 
         if self.dense:
@@ -693,7 +703,6 @@ class Wav2vec2BertClassHead(nn.Module):
             self.out_proj = torch.nn.Linear(inner_dim, num_outs)
 
     def forward(self, features, padding_mask, **kwargs):
-
         x = self.dropout_input(features)
 
         x = self.pooler(x, padding_mask)
@@ -746,9 +755,13 @@ class Wav2vec2AudioFrameClassHead(nn.Module):
             layers = []
             in_dim = input_dim
             for dim in inner_dims:
-                layers.append([nn.Linear(in_dim, dim),
-                              get_activation_fn(activation_fn),
-                              nn.Dropout(p=dropout)])
+                layers.append(
+                    [
+                        nn.Linear(in_dim, dim),
+                        get_activation_fn(activation_fn),
+                        nn.Dropout(p=dropout),
+                    ]
+                )
                 in_dim = dim
             layers = sum(layers, [])
             self.dense = nn.Sequential(*layers)
@@ -757,18 +770,15 @@ class Wav2vec2AudioFrameClassHead(nn.Module):
         if isinstance(inner_dims, int):
             if inner_dims == 0:
                 self.out_proj = torch.nn.Linear(input_dim, num_outs)
-                self.out_activation_fn = utils.get_activation_fn(
-                    out_activation_fn)
+                self.out_activation_fn = utils.get_activation_fn(out_activation_fn)
             else:
                 self.out_proj = torch.nn.Linear(inner_dims, num_outs)
-                self.out_activation_fn = utils.get_activation_fn(
-                    out_activation_fn)
+                self.out_activation_fn = utils.get_activation_fn(out_activation_fn)
         else:
             self.out_proj = torch.nn.Linear(inner_dims[-1], num_outs)
             self.out_activation_fn = utils.get_activation_fn(out_activation_fn)
 
     def forward(self, features, **kwargs):
-
         if self.layer_norm_first:
             features = self.layer_norm(features)
         x = self.dropout_input(features)
@@ -815,12 +825,12 @@ class Wav2vec2AudioFrameClassTCNHead(nn.Module):
             kernel_size=kernel_size,
             dropout=dropout,
             mode=mode,
-            activation_fn=activation_fn)
+            activation_fn=activation_fn,
+        )
 
         self.out_proj = torch.nn.Linear(inner_channels[-1], num_outs)
 
     def forward(self, features, **kwargs):
-
         x = self.dropout_input(features)
         x = self.tcn(x.transpose(1, 2)).transpose(1, 2)
         x = self.out_proj(x)
@@ -878,14 +888,12 @@ class Wav2vec2AudioFrameClassLSTMHead(nn.Module):
             self.out_proj = torch.nn.Linear(inner_dim, num_outs)
 
     def forward(self, features, padding_mask):
-
         if padding_mask is None:
             padding_mask = torch.zeros(
-                (features.size(0), features.size(1)),
-                device=features.device).type(torch.bool)
+                (features.size(0), features.size(1)), device=features.device
+            ).type(torch.bool)
 
-        input_lengths, _ = (1 - padding_mask.long()
-                            ).sum(-1).sort(descending=True)
+        input_lengths, _ = (1 - padding_mask.long()).sum(-1).sort(descending=True)
 
         x, _, _ = self.lstm_enc(features, src_lengths=input_lengths)
 
@@ -902,8 +910,7 @@ class Wav2vec2AudioFrameClassLSTMHead(nn.Module):
 
 
 class ConformerFrameHead(nn.Module):
-    """Head for sentence-level classification tasks using ConformerEncoder.
-    """
+    """Head for sentence-level classification tasks using ConformerEncoder."""
 
     def __init__(
         self,
@@ -920,7 +927,6 @@ class ConformerFrameHead(nn.Module):
         self.out_proj = torch.nn.Linear(cfg.encoder_embed_dim, num_outs)
 
     def forward(self, features, padding_mask, **kwargs):
-
         x = self.dropout_input(features)
 
         x, _ = self.transf_enc(x, padding_mask=padding_mask, layer=None)
@@ -939,7 +945,6 @@ class Wav2vec2SequenceClassEncoder(Wav2VecEncoder):
     """
 
     def __init__(self, cfg: Wav2Vec2SeldClassConfig, tgt_len=1):
-
         self.apply_mask = cfg.apply_mask
         self.cfg = cfg
 
@@ -966,8 +971,7 @@ class Wav2vec2SequenceClassEncoder(Wav2VecEncoder):
         }
 
         if cfg.w2v_args is None:
-            state = checkpoint_utils.load_checkpoint_to_cpu(
-                cfg.w2v_path, arg_overrides)
+            state = checkpoint_utils.load_checkpoint_to_cpu(cfg.w2v_path, arg_overrides)
             w2v_args = state.get("cfg", None)
             if w2v_args is None:
                 w2v_args = convert_namespace_to_omegaconf(state["args"])
@@ -981,8 +985,7 @@ class Wav2vec2SequenceClassEncoder(Wav2VecEncoder):
             state = None
             w2v_args = cfg.w2v_args
             if isinstance(w2v_args, Namespace):
-                cfg.w2v_args = w2v_args = convert_namespace_to_omegaconf(
-                    w2v_args)
+                cfg.w2v_args = w2v_args = convert_namespace_to_omegaconf(w2v_args)
 
         model_normalized = w2v_args.task.get(
             "normalize", w2v_args.model.get("normalize", False)
@@ -1047,7 +1050,6 @@ class Wav2vec2SequenceClassEncoder(Wav2VecEncoder):
             p.param_group = "classifier_head"
 
     def forward(self, source, padding_mask, **kwargs):
-
         w2v_args = {
             "source": source,
             "padding_mask": padding_mask,
@@ -1107,7 +1109,6 @@ class Wav2vec2SeldSequenceClassEncoder(Wav2vec2SequenceClassEncoder):
             p.param_group = "regression_head"
 
     def forward(self, source, padding_mask, **kwargs):
-
         w2v_args = {
             "source": source,
             "padding_mask": padding_mask,
@@ -1148,7 +1149,6 @@ class Wav2vec2SeldAudioFrameClassEncoder(Wav2vec2SequenceClassEncoder):
     """
 
     def __init__(self, cfg: Wav2Vec2SeldAudioFrameClassConfig, tgt_len=1):
-
         self.apply_mask = cfg.apply_mask
         self.cfg = cfg
 
@@ -1175,8 +1175,7 @@ class Wav2vec2SeldAudioFrameClassEncoder(Wav2vec2SequenceClassEncoder):
         }
 
         if cfg.w2v_args is None:
-            state = checkpoint_utils.load_checkpoint_to_cpu(
-                cfg.w2v_path, arg_overrides)
+            state = checkpoint_utils.load_checkpoint_to_cpu(cfg.w2v_path, arg_overrides)
             w2v_args = state.get("cfg", None)
             if w2v_args is None:
                 w2v_args = convert_namespace_to_omegaconf(state["args"])
@@ -1190,8 +1189,7 @@ class Wav2vec2SeldAudioFrameClassEncoder(Wav2vec2SequenceClassEncoder):
             state = None
             w2v_args = cfg.w2v_args
             if isinstance(w2v_args, Namespace):
-                cfg.w2v_args = w2v_args = convert_namespace_to_omegaconf(
-                    w2v_args)
+                cfg.w2v_args = w2v_args = convert_namespace_to_omegaconf(w2v_args)
 
         model_normalized = w2v_args.task.get(
             "normalize", w2v_args.model.get("normalize", False)
@@ -1234,6 +1232,13 @@ class Wav2vec2SeldAudioFrameClassEncoder(Wav2vec2SequenceClassEncoder):
         self.freeze_finetune_updates = cfg.freeze_finetune_updates
         self.num_updates = 0
 
+        # if cfg.grad_norm:
+        #     self.final_proj = nn.Linear(
+        #         cfg.encoder_embed_dim, cfg.encoder_embed_dim)
+
+        #     for p in self.final_proj.parameters():
+        #         p.param_group = "w2v_model"
+
         self.classifier_head = Wav2vec2AudioFrameClassHead(
             input_dim=d,
             inner_dims=cfg.classifier_proj_size,
@@ -1262,8 +1267,15 @@ class Wav2vec2SeldAudioFrameClassEncoder(Wav2vec2SequenceClassEncoder):
         for p in self.regression_head.parameters():
             p.param_group = "regression_head"
 
-    def forward(self, source, padding_mask, **kwargs):
+        if cfg.grad_norm:
+            # assign the weights for each task
+            self.weights = torch.nn.Parameter(torch.ones(2).float())
+            self.weights.param_group = "weights_grad_norm"
 
+    def get_last_shared_layer(self):
+        return self.w2v_model.encoder.layers[-1]
+
+    def forward(self, source, padding_mask, **kwargs):
         w2v_args = {
             "source": source,
             "padding_mask": padding_mask,
@@ -1278,6 +1290,8 @@ class Wav2vec2SeldAudioFrameClassEncoder(Wav2vec2SequenceClassEncoder):
             x = res["x"]
             padding_mask = res["padding_mask"]
 
+        # if self.cfg.grad_norm:
+        #     x = self.final_proj(x)
         x = self.final_dropout(x)
 
         class_logits = self.classifier_head(x)
@@ -1300,7 +1314,6 @@ class Wav2vec2SeldAudioFrameClassTCNEncoder(Wav2vec2SeldAudioFrameClassEncoder):
     """
 
     def __init__(self, cfg: Wav2Vec2SeldAudioFrameClassTCNConfig, tgt_len=1):
-
         self.apply_mask = cfg.apply_mask
         self.cfg = cfg
 
@@ -1327,8 +1340,7 @@ class Wav2vec2SeldAudioFrameClassTCNEncoder(Wav2vec2SeldAudioFrameClassEncoder):
         }
 
         if cfg.w2v_args is None:
-            state = checkpoint_utils.load_checkpoint_to_cpu(
-                cfg.w2v_path, arg_overrides)
+            state = checkpoint_utils.load_checkpoint_to_cpu(cfg.w2v_path, arg_overrides)
             w2v_args = state.get("cfg", None)
             if w2v_args is None:
                 w2v_args = convert_namespace_to_omegaconf(state["args"])
@@ -1342,8 +1354,7 @@ class Wav2vec2SeldAudioFrameClassTCNEncoder(Wav2vec2SeldAudioFrameClassEncoder):
             state = None
             w2v_args = cfg.w2v_args
             if isinstance(w2v_args, Namespace):
-                cfg.w2v_args = w2v_args = convert_namespace_to_omegaconf(
-                    w2v_args)
+                cfg.w2v_args = w2v_args = convert_namespace_to_omegaconf(w2v_args)
 
         model_normalized = w2v_args.task.get(
             "normalize", w2v_args.model.get("normalize", False)
@@ -1425,7 +1436,6 @@ class Wav2vec2SeldAudioFrameClassLSTMEncoder(Wav2vec2SequenceClassEncoder):
     """
 
     def __init__(self, cfg: Wav2Vec2SeldAudioFrameClassLSTMConfig, tgt_len=1):
-
         self.apply_mask = cfg.apply_mask
         self.cfg = cfg
 
@@ -1452,8 +1462,7 @@ class Wav2vec2SeldAudioFrameClassLSTMEncoder(Wav2vec2SequenceClassEncoder):
         }
 
         if cfg.w2v_args is None:
-            state = checkpoint_utils.load_checkpoint_to_cpu(
-                cfg.w2v_path, arg_overrides)
+            state = checkpoint_utils.load_checkpoint_to_cpu(cfg.w2v_path, arg_overrides)
             w2v_args = state.get("cfg", None)
             if w2v_args is None:
                 w2v_args = convert_namespace_to_omegaconf(state["args"])
@@ -1467,8 +1476,7 @@ class Wav2vec2SeldAudioFrameClassLSTMEncoder(Wav2vec2SequenceClassEncoder):
             state = None
             w2v_args = cfg.w2v_args
             if isinstance(w2v_args, Namespace):
-                cfg.w2v_args = w2v_args = convert_namespace_to_omegaconf(
-                    w2v_args)
+                cfg.w2v_args = w2v_args = convert_namespace_to_omegaconf(w2v_args)
 
         model_normalized = w2v_args.task.get(
             "normalize", w2v_args.model.get("normalize", False)
@@ -1532,7 +1540,7 @@ class Wav2vec2SeldAudioFrameClassLSTMEncoder(Wav2vec2SequenceClassEncoder):
             hidden_size=cfg.regression_hidden_size,
             inner_dim=cfg.regression_proj_size,
             num_layers=cfg.regression_num_layers,
-            num_outs=cfg.target_length*cfg.doa_size,
+            num_outs=cfg.target_length * cfg.doa_size,
             activation_fn=cfg.regression_activation_fn,
             dropout_input=cfg.regression_input_dropout,
             dropout_lstm=cfg.regression_dropout_lstm,
@@ -1544,7 +1552,6 @@ class Wav2vec2SeldAudioFrameClassLSTMEncoder(Wav2vec2SequenceClassEncoder):
             p.param_group = "regression_head"
 
     def forward(self, source, padding_mask, **kwargs):
-
         w2v_args = {
             "source": source,
             "padding_mask": padding_mask,
@@ -1582,7 +1589,6 @@ class Wav2vec2SeldAudioFrameClassConformerEncoder(Wav2vec2SequenceClassEncoder):
     """
 
     def __init__(self, cfg: Wav2Vec2SeldAudioFrameClassConformerConfig, tgt_len=1):
-
         self.apply_mask = cfg.apply_mask
         self.cfg = cfg
 
@@ -1609,8 +1615,7 @@ class Wav2vec2SeldAudioFrameClassConformerEncoder(Wav2vec2SequenceClassEncoder):
         }
 
         if cfg.w2v_args is None:
-            state = checkpoint_utils.load_checkpoint_to_cpu(
-                cfg.w2v_path, arg_overrides)
+            state = checkpoint_utils.load_checkpoint_to_cpu(cfg.w2v_path, arg_overrides)
             w2v_args = state.get("cfg", None)
             if w2v_args is None:
                 w2v_args = convert_namespace_to_omegaconf(state["args"])
@@ -1624,8 +1629,7 @@ class Wav2vec2SeldAudioFrameClassConformerEncoder(Wav2vec2SequenceClassEncoder):
             state = None
             w2v_args = cfg.w2v_args
             if isinstance(w2v_args, Namespace):
-                cfg.w2v_args = w2v_args = convert_namespace_to_omegaconf(
-                    w2v_args)
+                cfg.w2v_args = w2v_args = convert_namespace_to_omegaconf(w2v_args)
 
         model_normalized = w2v_args.task.get(
             "normalize", w2v_args.model.get("normalize", False)
@@ -1687,7 +1691,6 @@ class Wav2vec2SeldAudioFrameClassConformerEncoder(Wav2vec2SequenceClassEncoder):
             p.param_group = "regression_head"
 
     def forward(self, source, padding_mask, **kwargs):
-
         w2v_args = {
             "source": source,
             "padding_mask": padding_mask,
@@ -1725,7 +1728,6 @@ class Wav2vec2SeldAccDoaAudioFrameClassEncoder(Wav2vec2SequenceClassEncoder):
     """
 
     def __init__(self, cfg: Wav2Vec2SeldAccDoaAudioFrameClassConfig, tgt_len=1):
-
         self.apply_mask = cfg.apply_mask
         self.cfg = cfg
 
@@ -1752,8 +1754,7 @@ class Wav2vec2SeldAccDoaAudioFrameClassEncoder(Wav2vec2SequenceClassEncoder):
         }
 
         if cfg.w2v_args is None:
-            state = checkpoint_utils.load_checkpoint_to_cpu(
-                cfg.w2v_path, arg_overrides)
+            state = checkpoint_utils.load_checkpoint_to_cpu(cfg.w2v_path, arg_overrides)
             w2v_args = state.get("cfg", None)
             if w2v_args is None:
                 w2v_args = convert_namespace_to_omegaconf(state["args"])
@@ -1767,8 +1768,7 @@ class Wav2vec2SeldAccDoaAudioFrameClassEncoder(Wav2vec2SequenceClassEncoder):
             state = None
             w2v_args = cfg.w2v_args
             if isinstance(w2v_args, Namespace):
-                cfg.w2v_args = w2v_args = convert_namespace_to_omegaconf(
-                    w2v_args)
+                cfg.w2v_args = w2v_args = convert_namespace_to_omegaconf(w2v_args)
 
         model_normalized = w2v_args.task.get(
             "normalize", w2v_args.model.get("normalize", False)
@@ -1825,7 +1825,6 @@ class Wav2vec2SeldAccDoaAudioFrameClassEncoder(Wav2vec2SequenceClassEncoder):
             p.param_group = "regression_head"
 
     def forward(self, source, padding_mask, **kwargs):
-
         w2v_args = {
             "source": source,
             "padding_mask": padding_mask,
