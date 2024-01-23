@@ -1,8 +1,9 @@
 import json
 import logging
 import os
+from collections import UserDict
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -31,6 +32,7 @@ from seld_wav2vec2.data import (
     AddTargetSeldAudioFrameClassDataset,
     AddTargetSeldSeqClassDataset,
     FileEventDataset,
+    FileEventSpecDataset,
 )
 
 logger = logging.getLogger(__name__)
@@ -79,7 +81,7 @@ class SpliceOutFilterShort(SpliceOut):
                     )
 
                     fading_out, fading_in = (
-                        sample[:, start:start + random_lengths[j] // 2],
+                        sample[:, start: start + random_lengths[j] // 2],
                         sample[
                             :,
                             start + random_lengths[j] // 2: start + random_lengths[j],
@@ -113,11 +115,32 @@ class SpliceOutFilterShort(SpliceOut):
         )
 
 
+class States(UserDict):
+    @property
+    def state_dict(self) -> Dict[str, Any]:
+        return self.data
+
+    def merge_state_dict(self, state_dict: Dict[str, Any]):
+        self.data.update(state_dict)
+
+
 @dataclass
 class SoundEventPretrainingConfig(AudioPretrainingConfig):
     norm_per_channel: bool = field(
         default=False,
         metadata={"help": ("Normalize per channel when have multiple channels")},
+    )
+    spectrogram_input: bool = field(
+        default=False,
+        metadata={
+            "help": ("Whether to feed the model with" "spectrogram of raw audio")
+        },
+    )
+    raw_audio_input: bool = field(
+        default=False, metadata={"help": ("Whether to use raw audio")}
+    )
+    spec_normalize: bool = field(
+        default=False, metadata={"help": ("Normalize the resulting " "spectrogram")}
     )
     audio_augm: bool = field(
         default=False, metadata={"help": "Apply data augmentation on the 3D audio"}
@@ -144,6 +167,20 @@ class SoundEventPretrainingConfig(AudioPretrainingConfig):
         metadata={"help": "always crop from the beginning if false"},
     )
     in_channels: int = II("model.in_channels")
+    n_mels: int = field(
+        default=64,
+        metadata={"help": "number of mel filters when using spectrogram"},
+    )
+    hop_len_s: float = field(
+        default=0.005,
+        metadata={"help": "hop length of STFT"},
+    )
+    spectrogram_1d: bool = field(
+        default=False, metadata={"help": ("Use spectrogram as 1d conv or 2d")}
+    )
+    gammatone_filter_banks: bool = field(
+        default=False, metadata={"help": ("Use gammatone_filter_banks or not")}
+    )
 
 
 @register_task("sound_event_pretraining", dataclass=SoundEventPretrainingConfig)
@@ -168,6 +205,11 @@ class SoundEventPretrainingTask(AudioPretrainingTask):
         )
 
         manifest_path = os.path.join(data_path, "{}.tsv".format(split))
+
+        if split == "valid" or split == "test":
+            shuffle = False
+        else:
+            shuffle = True
 
         audio_transforms = None
         if self.cfg.audio_augm:
@@ -203,23 +245,46 @@ class SoundEventPretrainingTask(AudioPretrainingTask):
                 f"SpliceOut: p: {self.cfg.params_augm[3]}\n"
             )
 
-        self.datasets[split] = FileEventDataset(
-            manifest_path=manifest_path,
-            sample_rate=task_cfg.get("sample_rate", self.cfg.sample_rate),
-            max_sample_size=self.cfg.max_sample_size,
-            min_sample_size=self.cfg.min_sample_size,
-            pad=task_cfg.enable_padding,
-            pad_max=False,
-            normalize=task_cfg.normalize,
-            norm_per_channel=self.cfg.norm_per_channel,
-            num_buckets=self.cfg.num_batch_buckets or int(self.cfg.tpu),
-            compute_mask_indices=(self.cfg.precompute_mask_indices or self.cfg.tpu),
-            text_compression_level=text_compression_level,
-            audio_transforms=audio_transforms if self.cfg.audio_augm else None,
-            params_augm=self.cfg.params_augm,
-            random_crop=self.cfg.random_crop,
-            **self._get_mask_precompute_kwargs(task_cfg),
-        )
+        if self.cfg.spectrogram_input:
+            self.datasets[split] = FileEventSpecDataset(
+                manifest_path=manifest_path,
+                sample_rate=task_cfg.get("sample_rate", self.cfg.sample_rate),
+                raw_audio_input=self.cfg.raw_audio_input,
+                max_sample_size=self.cfg.max_sample_size,
+                min_sample_size=self.cfg.min_sample_size,
+                shuffle=shuffle,
+                pad=task_cfg.enable_padding,
+                pad_max=False,
+                normalize=task_cfg.normalize,
+                spec_normalize=self.cfg.spec_normalize,
+                spectrogram_1d=self.cfg.spectrogram_1d,
+                norm_per_channel=self.cfg.norm_per_channel,
+                num_buckets=self.cfg.num_batch_buckets or int(self.cfg.tpu),
+                audio_transforms=audio_transforms,
+                random_crop=self.cfg.random_crop,
+                spec_augment=False,
+                n_mels=self.cfg.n_mels,
+                hop_len_s=self.cfg.hop_len_s,
+                gammatone_filter_banks=self.cfg.gammatone_filter_banks,
+            )
+        else:
+            self.datasets[split] = FileEventDataset(
+                manifest_path=manifest_path,
+                sample_rate=task_cfg.get("sample_rate", self.cfg.sample_rate),
+                max_sample_size=self.cfg.max_sample_size,
+                min_sample_size=self.cfg.min_sample_size,
+                pad=task_cfg.enable_padding,
+                pad_max=False,
+                normalize=task_cfg.normalize,
+                norm_per_channel=self.cfg.norm_per_channel,
+                num_buckets=self.cfg.num_batch_buckets or int(self.cfg.tpu),
+                compute_mask_indices=(self.cfg.precompute_mask_indices or self.cfg.tpu),
+                text_compression_level=text_compression_level,
+                audio_transforms=audio_transforms,
+                params_augm=self.cfg.params_augm,
+                random_crop=self.cfg.random_crop,
+                **self._get_mask_precompute_kwargs(task_cfg),
+            )
 
 
 @dataclass
@@ -289,6 +354,17 @@ class SoundEventFinetuningConfig(SoundEventPretrainingConfig):
         default=(0.1, 1.0, 0.025),
         metadata={"help": ("threshold range: min, max, step")},
     )
+    spec_augment: bool = field(
+        default=False, metadata={"help": "spec-augment of shift"}
+    )
+    time_mask_F: int = field(
+        default=21,
+        metadata={"help": "f mask parameter in spec data augment"},
+    )
+    time_mask_T: int = field(
+        default=20,
+        metadata={"help": "t mask parameter in spec data augment"},
+    )
 
 
 @register_task("sound_event_finetuning", dataclass=SoundEventFinetuningConfig)
@@ -315,8 +391,9 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
             self.feat_cls = cls_feature_class.FeatureClass(params)
             self.cls_new_metric = SELDMetrics(nb_classes=self.cfg.nb_classes)
 
-        self.state.add_factory("best_threshold", 0.5)
-        self.state.add_factory("best_score", None)
+        self.state = States()
+        self.state["best_threshold"] = 0.5
+        self.state["best_score"] = None
         self.valid_update = 0
 
         self.class_probs_list = []
@@ -352,10 +429,12 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
             doa_swap_augment = False
             shift_augment = False
             shuffle = False
+            spec_augment = False
         else:
             audio_augm = self.cfg.audio_augm
             random_crop = self.cfg.random_crop
             shuffle = True
+            spec_augment = self.cfg.spec_augment
 
             if self.cfg.doa_swap_prob > 0.0:
                 doa_swap_augment = True
@@ -367,6 +446,7 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
             else:
                 shift_augment = False
 
+        audio_transforms = None
         if audio_augm:
             assert all(
                 p >= 0 for p in self.cfg.params_augm
@@ -403,23 +483,47 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
                 f"p: {self.cfg.params_augm[4]}"
             )
 
-        self.datasets[split] = FileEventDataset(
-            manifest_path=manifest_path,
-            sample_rate=task_cfg.get("sample_rate", self.cfg.sample_rate),
-            max_sample_size=self.cfg.max_sample_size,
-            min_sample_size=self.cfg.min_sample_size,
-            shuffle=shuffle,
-            pad=task_cfg.labels is not None or task_cfg.enable_padding,
-            pad_max=self.cfg.padding_max,
-            normalize=task_cfg.normalize,
-            norm_per_channel=self.cfg.norm_per_channel,
-            num_buckets=self.cfg.num_batch_buckets or int(self.cfg.tpu),
-            compute_mask_indices=(self.cfg.precompute_mask_indices or self.cfg.tpu),
-            text_compression_level=text_compression_level,
-            audio_transforms=audio_transforms if audio_augm else None,
-            random_crop=random_crop,
-            **self._get_mask_precompute_kwargs(task_cfg),
-        )
+        if self.cfg.spectrogram_input:
+            self.datasets[split] = FileEventSpecDataset(
+                manifest_path=manifest_path,
+                sample_rate=task_cfg.get("sample_rate", self.cfg.sample_rate),
+                raw_audio_input=self.cfg.raw_audio_input,
+                max_sample_size=self.cfg.max_sample_size,
+                min_sample_size=self.cfg.min_sample_size,
+                shuffle=shuffle,
+                pad=task_cfg.enable_padding,
+                pad_max=False,
+                normalize=task_cfg.normalize,
+                spec_normalize=self.cfg.spec_normalize,
+                spectrogram_1d=self.cfg.spectrogram_1d,
+                norm_per_channel=self.cfg.norm_per_channel,
+                num_buckets=self.cfg.num_batch_buckets or int(self.cfg.tpu),
+                audio_transforms=audio_transforms,
+                random_crop=self.cfg.random_crop,
+                spec_augment=spec_augment,
+                time_mask_F=self.cfg.time_mask_F,
+                time_mask_T=self.cfg.time_mask_T,
+                n_mels=self.cfg.n_mels,
+                hop_len_s=self.cfg.hop_len_s,
+            )
+        else:
+            self.datasets[split] = FileEventDataset(
+                manifest_path=manifest_path,
+                sample_rate=task_cfg.get("sample_rate", self.cfg.sample_rate),
+                max_sample_size=self.cfg.max_sample_size,
+                min_sample_size=self.cfg.min_sample_size,
+                shuffle=shuffle,
+                pad=task_cfg.labels is not None or task_cfg.enable_padding,
+                pad_max=self.cfg.padding_max,
+                normalize=task_cfg.normalize,
+                norm_per_channel=self.cfg.norm_per_channel,
+                num_buckets=self.cfg.num_batch_buckets or int(self.cfg.tpu),
+                compute_mask_indices=(self.cfg.precompute_mask_indices or self.cfg.tpu),
+                text_compression_level=text_compression_level,
+                audio_transforms=audio_transforms,
+                random_crop=random_crop,
+                **self._get_mask_precompute_kwargs(task_cfg),
+            )
 
         label_path = os.path.join(data_path, f"{split}.{task_cfg.labels}")
 
@@ -441,6 +545,7 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
                 shift_prob=self.cfg.shift_prob,
                 shift_rollover=self.cfg.shift_rollover,
                 n_classes=self.cfg.nb_classes,
+                in_channels=self.cfg.in_channels
             )
         else:
             self.datasets[split] = AddTargetSeldSeqClassDataset(
@@ -534,7 +639,7 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
                             # clear 2020 seld metrics
                             self.cls_new_metric.reset_states()
                         else:
-                            seld_score_i = self.compute_score_201X_for_thr(
+                            _, _, _, _, seld_score_i = self.compute_score_201X_for_thr(
                                 class_probs.copy(),
                                 class_labels.copy(),
                                 reg_logits.copy(),
@@ -557,8 +662,11 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
                     min_seld_score = np.min(seld_score_list)
                     if self.best_score:
                         if min_seld_score < self.best_score:
-                            self.state.add_factory("best_threshold", thr)
-                            self.state.add_factory("best_score", min_seld_score)
+                            self.state["best_threshold"] = thr
+                            self.state["best_score"] = min_seld_score
+                    else:
+                        self.state["best_threshold"] = thr
+                        self.state["best_score"] = min_seld_score
 
                     logger.info(f"optimal threshold: {thr}")
                     logger.info(f"min_seld_score: {min_seld_score}")
@@ -575,11 +683,9 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
                         reg_logits = self.reg_logits_list[i]
                         reg_targets = self.reg_targets_list[i]
 
-                        self.compute_score_2020_for_thr(class_probs,
-                                                        class_labels,
-                                                        reg_logits,
-                                                        reg_targets,
-                                                        thr=thr)
+                        self.compute_score_2020_for_thr(
+                            class_probs, class_labels, reg_logits, reg_targets, thr=thr
+                        )
 
                     er, f, de, de_f = self.cls_new_metric.compute_seld_scores()
                     seld_score = early_stopping_metric([er, f], [de, de_f])
@@ -587,14 +693,14 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
                     # clear 2020 seld metrics
                     self.cls_new_metric.reset_states()
                 else:
-                    self.compute_score_201X_for_thr(
-                                class_probs,
-                                class_labels,
-                                reg_logits,
-                                reg_targets,
-                                thr=thr,
-                                eval_dcase=self.cfg.eval_dcase,
-                            )
+                    er, f, de, de_f, seld_score = self.compute_score_201X_for_thr(
+                        class_probs,
+                        class_labels,
+                        reg_logits,
+                        reg_targets,
+                        thr=thr,
+                        eval_dcase=self.cfg.eval_dcase,
+                    )
 
                 if min_seld_score is not None:
                     assert (
@@ -616,14 +722,20 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
 
     @property
     def best_score(self):
-        return self.state.best_score
+        return self.state["best_score"]
 
     @property
     def best_threshold(self):
-        return self.state.best_threshold
+        return self.state["best_threshold"]
 
     def compute_score_201X_for_thr(
-        self, class_probs, class_labels, reg_logits, reg_targets, thr=0.5, eval_dcase="2019"
+        self,
+        class_probs,
+        class_labels,
+        reg_logits,
+        reg_targets,
+        thr=0.5,
+        eval_dcase="2019",
     ):
         class_mask = class_probs > thr
         y_pred_class = class_mask.astype("float32")
@@ -640,14 +752,14 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
         y_true_reg = reg_targets.astype("float32")
 
         if eval_dcase == "2019":
-            _, _, _, _, seld_score = self.eval_seld_score_2019(
+            er, f, de, de_f, seld_score = self.eval_seld_score_2019(
                 y_pred_reg, y_true_reg, y_pred_class, y_true_class
             )
         else:
-            _, _, _, _, seld_score = self.eval_seld_score_2018(
+            er, f, de, de_f, seld_score = self.eval_seld_score_2018(
                 y_pred_reg, y_true_reg, y_pred_class, y_true_class
             )
-        return seld_score
+        return er, f, de, de_f, seld_score
 
     def eval_seld_score_2018(self, doa_pred, doa_gt, sed_pred, sed_gt):
         er_metric = compute_doa_scores_regr_xyz(doa_pred, doa_gt, sed_pred, sed_gt)
@@ -673,8 +785,9 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
 
         return _er, _f, _doa_err, _frame_recall, _seld_scr
 
-    def compute_score_2020_for_thr(self, class_probs, class_labels, reg_logits, reg_targets, thr=0.5):
-
+    def compute_score_2020_for_thr(
+        self, class_probs, class_labels, reg_logits, reg_targets, thr=0.5
+    ):
         class_mask = class_probs > thr
         y_pred_class = class_mask.astype("float32")
 
@@ -683,17 +796,13 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
         class_labels[class_pad_mask] = 0
         y_true_class = class_labels.astype("float32")
 
-        class_mask_extended = np.concatenate(
-            [class_mask] * self.cfg.doa_size, axis=-1
-        )
+        class_mask_extended = np.concatenate([class_mask] * self.cfg.doa_size, axis=-1)
 
         reg_logits[~class_mask_extended] = 0
         y_pred_reg = reg_logits.astype("float32")
         y_true_reg = reg_targets.astype("float32")
 
-        self.eval_seld_score_2020(
-            y_pred_reg, y_true_reg, y_pred_class, y_true_class
-        )
+        self.eval_seld_score_2020(y_pred_reg, y_true_reg, y_pred_class, y_true_class)
 
     def eval_seld_score_2020(self, doa_pred, doa_gt, sed_pred, sed_gt):
         pred_dict = self.feat_cls.regression_label_format_to_output_format(
