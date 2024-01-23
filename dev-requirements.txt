@@ -76,6 +76,8 @@ lxml==5.1.0
     # via sacrebleu
 matplotlib==3.5.3
     # via seld_wav2vec2 (setup.py)
+mpire==2.9.0
+    # via seld_wav2vec2 (setup.py)
 numba==0.58.1
     # via
     #   librosa
@@ -135,6 +137,8 @@ pycodestyle==2.11.1
     # via autopep8
 pycparser==2.21
     # via cffi
+pygments==2.17.2
+    # via mpire
 pyparsing==3.1.1
     # via matplotlib
 python-dateutil==2.8.2
@@ -215,7 +219,9 @@ torchaudio==0.12.1+cu113
 torchvision==0.13.1+cu113
     # via seld_wav2vec2 (setup.py)
 tqdm==4.66.1
-    # via fairseq
+    # via
+    #   fairseq
+    #   mpire
 typing-extensions==4.9.0
     # via
     #   omegaconf
