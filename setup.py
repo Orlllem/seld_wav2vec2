@@ -13,15 +13,17 @@ requirements = [
     "librosa==0.9.2",
     "scikit-learn==0.24.2",
     "matplotlib==3.5.3",
-    # "torch==1.12.1",
-    # "torchvision==0.13.1",
-    # "torchaudio==0.12.1",
-]
-
-dvc_requirements = [
+    "pillow==10.0.1",
+    "spafe==0.3.2",
+    "pyarrow==13.0.0",
     "torch==1.12.1",
     "torchvision==0.13.1",
     "torchaudio==0.12.1",
+    "mpire==2.9.0"
+]
+
+
+dvc_requirements = [
     "dvclive==2.7.0",
     "dvc-gdrive==2.19.2"
 ]
@@ -29,6 +31,7 @@ dvc_requirements = [
 dev_requirements = [
     "filelock==3.12.0",
     "wandb==0.15.3",
+    "importlib-resources==5.12.0",
     "tensorboardX==2.6.0",
     "torch_audiomentations==0.11.0",
     "fairseq @ git+https://github.com/pytorch/fairseq.git@"
@@ -37,7 +40,7 @@ dev_requirements = [
 
 setup(
     name='seld_wav2vec2',
-    version='0.1.0',
+    version='1.0.0',
     author='Orlem',
     long_description=open('README.md').read(),
     packages=find_packages('src', exclude=[
