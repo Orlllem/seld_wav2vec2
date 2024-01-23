@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from fairseq.data import BaseWrapperDataset
 
-from seld_wav2vec2.data.transforms import RandomSeqShift, RandomSwapChannel
+from seld_wav2vec2.data.transforms import RandomSwapChannel, select_shift_tf
 
 
 def check_r_unit(x, y, z):
@@ -133,6 +133,7 @@ class AddTargetSeldAudioFrameClassDataset(AddTargetEventDataset):
         shift_prob=0.5,
         shift_rollover=False,
         n_classes=11,
+        in_channels=4
     ):
         super().__init__(dataset, labels)
 
@@ -141,16 +142,18 @@ class AddTargetSeldAudioFrameClassDataset(AddTargetEventDataset):
         if doa_swap_augment and shift_augment:
             self.swap_transform = RandomSwapChannel(
                 p=doa_swap_prob, n_classes=n_classes)
-            self.shift_transform = RandomSeqShift(
-                p=shift_prob, rollover=shift_rollover)
+            self.shift_transform = select_shift_tf(
+                p=shift_prob, rollover=shift_rollover,
+                in_channels=in_channels)
         elif doa_swap_augment and shift_augment is False:
             self.swap_transform = RandomSwapChannel(
                 p=doa_swap_prob, n_classes=n_classes)
             self.shift_transform = None
         elif shift_augment and doa_swap_augment is False:
             self.swap_transform = None
-            self.shift_transform = RandomSeqShift(
-                p=shift_prob, rollover=shift_rollover)
+            self.shift_transform = select_shift_tf(
+                p=shift_prob, rollover=shift_rollover,
+                in_channels=in_channels)
         else:
             self.swap_transform = None
             self.shift_transform = None
@@ -159,12 +162,6 @@ class AddTargetSeldAudioFrameClassDataset(AddTargetEventDataset):
         item = self.dataset[index]
 
         item_dict = self.get_label(index)
-
-        # x = torch.tensor(item_dict["x"]).T  # (T, N)
-        # y = torch.tensor(item_dict["y"]).T  # (T, N)
-        # z = torch.tensor(item_dict["z"]).T  # (T, N)
-
-        # doa_labels = torch.cat([x, y, z], dim=-1)  # (T, 3*N)
 
         sed_labels = torch.tensor(item_dict["sed_labels"])  # (T, N)
         doa_labels = torch.tensor(item_dict["doa_labels"])  # (T, 3*N)
