@@ -655,10 +655,16 @@ class MultitaskSeldAudioFrameCriterion(FairseqCriterion):
             if self.focal_loss:
                 if self.focal_bw:
                     class_labels_1d = class_labels.reshape(-1).cpu().numpy()
-                    class_weights = class_weight.compute_class_weight(
-                        "balanced", np.unique(class_labels_1d), class_labels_1d
-                    )
-                    focal_alpha = class_weights[1] / sum(class_weights)
+                    unique_labels = np.unique(class_labels_1d)
+                    if len(unique_labels) > 1:
+                        class_weights = class_weight.compute_class_weight(
+                            "balanced", unique_labels, class_labels_1d
+                        )
+                        focal_alpha = class_weights[1] / sum(class_weights)
+                    elif all(unique_labels == [0]):
+                        focal_alpha = 0.0
+                    else:
+                        focal_alpha = 1.0
                 else:
                     focal_alpha = self.focal_alpha
                 multi_label_loss = sigmoid_focal_loss(
