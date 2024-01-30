@@ -2,54 +2,44 @@ import contextlib
 import logging
 from argparse import Namespace
 from dataclasses import dataclass, field
-from typing import Any, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from fairseq import checkpoint_utils, tasks, utils
+from fairseq.dataclass import ChoiceEnum
 from fairseq.dataclass.utils import convert_namespace_to_omegaconf
 from fairseq.models import BaseFairseqModel, FairseqEncoder, register_model
-from fairseq.models.lstm import DEFAULT_MAX_SOURCE_POSITIONS, LSTMEncoder
-from fairseq.models.wav2vec.wav2vec2 import (
-    EXTRACTOR_MODE_CHOICES,
-    ConformerEncoder,
-    Wav2Vec2Config,
-)
 from fairseq.models.wav2vec.wav2vec2_asr import (
     Wav2Vec2AsrConfig,
     Wav2VecCtc,
     Wav2VecEncoder,
 )
-from fairseq.modules import LayerNorm
+from fairseq.modules import FairseqDropout, LayerNorm
 from fairseq.tasks import FairseqTask
 from omegaconf import open_dict
 from torch import Tensor
 
-from seld_wav2vec2.model.TCN import TemporalConvNet
-from seld_wav2vec2.model.utils import get_activation_fn
-
-
-class DummyDictionary:
-    def __init__(self, vocab_size):
-        self.vocab_len = vocab_size
-        self.symbols = []
-        for i in range(self.vocab_len):
-            self.symbols.append(i)
-        self.count = self.vocab_len
-        self.indices = {}
-        for i in range(self.vocab_len):
-            self.indices[i] = i
-
-    def __len__(self):
-        """Returns the number of symbols in the dictionary"""
-        return len(self.symbols)
-
-    def pad(self):
-        """Helper to get index of pad symbol"""
-        return None
-
+from seld_wav2vec2.model.conv import InceptionTimeModel
+from seld_wav2vec2.model.tcn import (
+    MultiScaleTcnConfig,
+    TcnConfig,
+    TemporalConvNet,
+    Wav2vec2AudioFrameClassMultiScaleTcnHead,
+)
+from seld_wav2vec2.model.utils import SiLU_inplace_to_False, get_activation_fn
+from seld_wav2vec2.model.wav2vec2_multi_ch import (
+    ConformerEncoderHeader,
+    TransformerEncoderHeader,
+    Wav2Vec2HeaderConfig,
+)
 
 logger = logging.getLogger(__name__)
+
+
+RNN_CHOICES = ChoiceEnum(["GRU", "LSTM"])
+ATT_CHOICES = ChoiceEnum(["add-attention", "local-aware-attention", "self-attention"])
 
 
 def _mean_pooling(enc_feats, src_masks):
@@ -71,12 +61,12 @@ def freeze_module_params(m):
             p.requires_grad = False
 
 
-class LSTMEncoder3D(LSTMEncoder):
-    """LSTM encoder."""
+class RNNEncoder3D(nn.Module):
+    """RNN 3D encoder (B, T, C)."""
 
     def __init__(
         self,
-        dictionary,
+        layer_type="LSTM",
         embed_dim=512,
         hidden_size=512,
         num_layers=1,
@@ -84,35 +74,42 @@ class LSTMEncoder3D(LSTMEncoder):
         dropout_out=0.1,
         bidirectional=False,
         left_pad=True,
-        pretrained_embed=None,
-        padding_idx=None,
-        max_source_positions=DEFAULT_MAX_SOURCE_POSITIONS,
     ):
-        super().__init__(
-            dictionary,
-            embed_dim=embed_dim,
+        super().__init__()
+        self.num_layers = num_layers
+        self.dropout_in_module = FairseqDropout(
+            dropout_in * 1.0, module_name=self.__class__.__name__
+        )
+        self.dropout_out_module = FairseqDropout(
+            dropout_out * 1.0, module_name=self.__class__.__name__
+        )
+        self.bidirectional = bidirectional
+        self.hidden_size = hidden_size
+
+        self.rnn = getattr(nn, str(layer_type))(
+            input_size=embed_dim,
             hidden_size=hidden_size,
             num_layers=num_layers,
-            dropout_in=dropout_in,
-            dropout_out=dropout_out,
+            dropout=self.dropout_out_module.p if num_layers > 1 else 0.0,
             bidirectional=bidirectional,
-            left_pad=left_pad,
-            pretrained_embed=pretrained_embed,
-            padding_idx=padding_idx,
-            max_source_positions=max_source_positions,
         )
+        self.left_pad = left_pad
+
+        self.output_units = hidden_size
+        if bidirectional:
+            self.output_units *= 2
 
     def forward(
         self,
-        src_tokens: Tensor,
+        src_input: Tensor,
         src_lengths: Tensor,
         enforce_sorted: bool = True,
     ):
         """
         Args:
-            src_tokens (LongTensor): tokens in the source language of
+            src_input (FloatTensor): tokens in the source language of
                 shape `(batch, src_len)`
-            src_lengths (LongTensor): lengths of each source sentence of
+            src_lengths (FloatTensor): lengths of each source sentence of
                 shape `(batch)`
             enforce_sorted (bool, optional): if True, `src_tokens` is
                 expected to contain sequences sorted by length in a
@@ -122,17 +119,16 @@ class LSTMEncoder3D(LSTMEncoder):
         if self.left_pad:
             # nn.utils.rnn.pack_padded_sequence requires right-padding;
             # convert left-padding to right-padding
-            src_tokens = utils.convert_padding_direction(
-                src_tokens,
-                torch.zeros_like(src_tokens).fill_(self.padding_idx),
+            src_input = utils.convert_padding_direction(
+                src_input,
+                torch.zeros_like(src_input).fill_(self.padding_idx),
                 left_to_right=True,
             )
 
-        bsz, seqlen, _ = src_tokens.size()
+        bsz, seqlen, _ = src_input.size()
 
-        # embed tokens
-        x = self.embed_tokens(src_tokens)
-        x = self.dropout_in_module(x)
+        # input dropout
+        x = self.dropout_in_module(src_input)
 
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
@@ -142,14 +138,16 @@ class LSTMEncoder3D(LSTMEncoder):
             x, src_lengths.cpu(), enforce_sorted=enforce_sorted
         )
 
-        # apply LSTM
+        # apply RNN
         if self.bidirectional:
             state_size = 2 * self.num_layers, bsz, self.hidden_size
         else:
             state_size = self.num_layers, bsz, self.hidden_size
         h0 = x.new_zeros(*state_size)
         c0 = x.new_zeros(*state_size)
-        packed_outs, (final_hiddens, final_cells) = self.lstm(packed_x, (h0, c0))
+
+        with torch.backends.cudnn.flags(enabled=False):
+            packed_outs, (final_hiddens, final_cells) = self.rnn(packed_x, (h0, c0))
 
         # unpack outputs and apply dropout
         x, _ = nn.utils.rnn.pad_packed_sequence(
@@ -170,6 +168,22 @@ class LSTMEncoder3D(LSTMEncoder):
                 final_hiddens,  # num_layers x batch x num_directions*hidden
                 final_cells,  # num_layers x batch x num_directions*hidden
                 # encoder_padding_mask,  # seq_len x batch
+            )
+        )
+
+    def combine_bidir(self, outs, bsz: int):
+        out = outs.view(self.num_layers, 2, bsz, -1).transpose(1, 2).contiguous()
+        return out.view(self.num_layers, bsz, -1)
+
+    def reorder_encoder_out(
+        self, encoder_out: Tuple[Tensor, Tensor, Tensor, Tensor], new_order
+    ):
+        return tuple(
+            (
+                encoder_out[0].index_select(1, new_order),
+                encoder_out[1].index_select(1, new_order),
+                encoder_out[2].index_select(1, new_order),
+                encoder_out[3].index_select(1, new_order),
             )
         )
 
@@ -264,6 +278,10 @@ class Wav2Vec2SeldAudioFrameClassConfig(Wav2Vec2SeldConfig):
             "help": ("number of layers to freeze in the pretrained transformer model")
         },
     )
+    use_recurrent_block: bool = field(
+        default=False, metadata={"help": "use recurrent block"}
+    )
+    recurrent: Optional[TcnConfig] = TcnConfig()
     layer_norm_first: bool = field(
         default=False, metadata={"help": "apply layernorm first in the header"}
     )
@@ -289,7 +307,7 @@ class Wav2Vec2SeldAudioFrameClassConfig(Wav2Vec2SeldConfig):
         metadata={"help": " activation function of regression inner"},
     )
     regression_out_activation_fn: str = field(
-        default="linear",
+        default="tanh",
         metadata={"help": " activation function of regression output"},
     )
     regression_proj_size: Any = field(
@@ -320,53 +338,42 @@ class Wav2Vec2SeldAudioFrameClassTCNConfig(Wav2Vec2SeldConfig):
             "help": ("number of layers to freeze in the pretrained transformer model")
         },
     )
-    classifier_inner_channels: Tuple[int, ...] = field(
-        default=(100, 100), metadata={"help": "inner dimensions of TCN classifier"}
+    use_recurrent_block: Optional[bool] = field(
+        default=False, metadata={"help": "use recurrent block"}
+    )
+    recurrent: Optional[TcnConfig] = TcnConfig()
+    bidirectional: Optional[bool] = field(
+        default=False, metadata={"help": "use bidirectional block"}
+    )
+    merge_cat: Optional[bool] = field(
+        default=False, metadata={"help": "use merge cat in bidirectional block"}
+    )
+    attention: Optional[bool] = field(
+        default=False, metadata={"help": "use attention block"}
+    )
+    att_type: ATT_CHOICES = field(
+        default="add-attention", metadata={"help": "attention type"}
     )
     classifier_input_dropout: float = field(
         default=0.0,
         metadata={"help": "dropout of in ClassifierHead applied to input features"},
     )
-    classifier_dropout: float = field(
-        default=0.0, metadata={"help": "dropout of dense in ClassifierHead"}
+    classifier_tcn: TcnConfig = TcnConfig()
+    regression_input_dropout: float = field(
+        default=0.0, metadata={"help": "dropout of proj in RegressionHead"}
+    )
+    regression_tcn: TcnConfig = TcnConfig()
+    regression_out_activation_fn: str = field(
+        default="tanh",
+        metadata={"help": " activation function of regression output"},
     )
     target_length: int = field(
         default=11, metadata={"help": "number of targets in classification"}
     )
-    classifier_kernel_size: int = field(
-        default=5, metadata={"help": "kernel-size in ClassifierHead"}
-    )
-    classifier_norm_mode: EXTRACTOR_MODE_CHOICES = field(
-        default="default",
-        metadata={"help": "norm type used in block"},
-    )
-    classifier_activation_fn: str = field(
-        default="relu",
-        metadata={"help": " activation function of head"},
-    )
-    regression_inner_channels: Tuple[int, ...] = field(
-        default=(100, 100), metadata={"help": "inner dimensions of TCN regression"}
-    )
-    regression_input_dropout: float = field(
-        default=0.0, metadata={"help": "dropout of proj in RegressionHead"}
-    )
-    regression_dropout: float = field(
-        default=0.0, metadata={"help": "dropout of in RegressionHead"}
-    )
-    regression_kernel_size: int = field(
-        default=5, metadata={"help": "kernel-size in RegressionHead"}
-    )
-    regression_norm_mode: EXTRACTOR_MODE_CHOICES = field(
-        default="default",
-        metadata={"help": "norm type used in block"},
-    )
-    regression_activation_fn: str = field(
-        default="relu",
-        metadata={"help": " activation function of regression inner"},
-    )
     doa_size: int = field(
         default=3, metadata={"help": "number of DOA in RegressionHead"}
     )
+    grad_norm: bool = field(default=False, metadata={"help": "apply gradnorm to model"})
 
 
 @dataclass
@@ -375,24 +382,140 @@ class Wav2Vec2SeqSeldAudioFrameClassTCNConfig(Wav2Vec2SeldAudioFrameClassTCNConf
 
 
 @dataclass
-class Wav2Vec2SeldAudioFrameClassLSTMConfig(Wav2Vec2SeldAudioFrameClassConfig):
+class Wav2Vec2SeldAudioFrameClassInceptionTimeConfig(Wav2Vec2SeldConfig):
+    n_trans_layers_to_freeze: int = field(
+        default=0,
+        metadata={
+            "help": ("number of layers to freeze in the pretrained transformer model")
+        },
+    )
+    use_recurrent_block: bool = field(
+        default=False, metadata={"help": "use recurrent block"}
+    )
+    recurrent: Optional[TcnConfig] = TcnConfig()
+    layer_norm_first: bool = field(
+        default=False, metadata={"help": "apply layernorm first in the header"}
+    )
+    classifier_activation_fn: str = field(
+        default="relu",
+        metadata={"help": " activation function of head"},
+    )
+    classifier_input_dropout: float = field(
+        default=0.0,
+        metadata={"help": "dropout of in ClassifierHead applied to input features"},
+    )
+    classifier_dropout: float = field(
+        default=0.0, metadata={"help": "dropout of dense in ClassifierHead"}
+    )
+    classifier_bn: bool = field(
+        default=False, metadata={"help": "batch norm in ClassifierHead"}
+    )
+    target_length: int = field(
+        default=11, metadata={"help": "number of targets in classification"}
+    )
+    classifier_filters: int = field(
+        default=32, metadata={"help": "number of filters of classifier"}
+    )
+    classifier_depth: int = field(
+        default=6, metadata={"help": "depth of classifier"}
+    )
+    regression_activation_fn: str = field(
+        default="relu",
+        metadata={"help": " activation function of regression inner"},
+    )
+    regression_out_activation_fn: str = field(
+        default="tanh",
+        metadata={"help": " activation function of regression output"},
+    )
+    regression_filters: int = field(
+        default=32, metadata={"help": "number of filters of regression"}
+    )
+    regression_depth: int = field(
+        default=6, metadata={"help": "depth of regression"}
+    )
+    regression_input_dropout: float = field(
+        default=0.0, metadata={"help": "dropout of proj in RegressionHead"}
+    )
+    regression_dropout: float = field(
+        default=0.0, metadata={"help": "dropout of in RegressionHead"}
+    )
+    regression_bn: bool = field(
+        default=False, metadata={"help": "batch norm in RegressionHead"}
+    )
+    doa_size: int = field(
+        default=3, metadata={"help": "number of DOA in RegressionHead"}
+    )
+    grad_norm: bool = field(default=False, metadata={"help": "apply gradnorm to model"})
+
+
+@dataclass
+class Wav2Vec2SeqSeldAudioFrameClassInceptionTimeConfig(
+    Wav2Vec2SeldAudioFrameClassInceptionTimeConfig
+):
+    pass
+
+
+@dataclass
+class Wav2Vec2SeldAudioFrameClassMultiScaleTCNConfig(Wav2Vec2SeldConfig):
+    n_trans_layers_to_freeze: int = field(
+        default=0,
+        metadata={
+            "help": ("number of layers to freeze in the pretrained transformer model")
+        },
+    )
+    use_recurrent_block: bool = field(
+        default=False, metadata={"help": "use recurrent block"}
+    )
+    recurrent: Optional[TcnConfig] = TcnConfig()
+    classifier_input_dropout: float = field(
+        default=0.0,
+        metadata={"help": "dropout of in ClassifierHead applied to input features"},
+    )
+    classifier: MultiScaleTcnConfig = MultiScaleTcnConfig()
+    target_length: int = field(
+        default=11, metadata={"help": "number of targets in classification"}
+    )
+    regression: MultiScaleTcnConfig = MultiScaleTcnConfig()
+    regression_out_activation_fn: str = field(
+        default="tanh",
+        metadata={"help": " activation function of regression output"},
+    )
+    regression_input_dropout: float = field(
+        default=0.0, metadata={"help": "dropout of proj in RegressionHead"}
+    )
+    doa_size: int = field(
+        default=3, metadata={"help": "number of DOA in RegressionHead"}
+    )
+    grad_norm: bool = field(default=False, metadata={"help": "apply gradnorm to model"})
+
+
+@dataclass
+class Wav2Vec2SeqSeldAudioFrameClassMultiScaleTCNConfig(
+    Wav2Vec2SeldAudioFrameClassMultiScaleTCNConfig
+):
+    pass
+
+
+@dataclass
+class Wav2Vec2SeldAudioFrameClassRNNConfig(Wav2Vec2SeldAudioFrameClassConfig):
+    layer_type: RNN_CHOICES = field(default="GRU", metadata={"help": "rnn hidden type"})
     classifier_hidden_size: int = field(
-        default=768, metadata={"help": "lstm hidden_size in ClassifierHead"}
+        default=768, metadata={"help": "rnn hidden_size in ClassifierHead"}
     )
     regression_hidden_size: int = field(
-        default=768, metadata={"help": "lstm hidden_size in RegressionHead"}
+        default=768, metadata={"help": "rnn hidden_size in RegressionHead"}
     )
     classifier_num_layers: int = field(
-        default=2, metadata={"help": "lstm number layers in ClassifierHead"}
+        default=2, metadata={"help": "rnn number layers in ClassifierHead"}
     )
     regression_num_layers: int = field(
-        default=2, metadata={"help": "lstm number layers in ClassifierHead"}
+        default=2, metadata={"help": "rnn number layers in ClassifierHead"}
     )
-    classifier_dropout_lstm: float = field(
-        default=0.0, metadata={"help": "dropout of lstm in ClassifierHead"}
+    classifier_dropout: float = field(
+        default=0.0, metadata={"help": "dropout of rnn in ClassifierHead"}
     )
-    regression_dropout_lstm: float = field(
-        default=0.0, metadata={"help": "dropout of lstm in RegressionHead"}
+    regression_dropout: float = field(
+        default=0.0, metadata={"help": "dropout of rnn in RegressionHead"}
     )
     classifier_bidirectional: bool = field(
         default=False, metadata={"help": "whether to use bidirectional"}
@@ -400,10 +523,15 @@ class Wav2Vec2SeldAudioFrameClassLSTMConfig(Wav2Vec2SeldAudioFrameClassConfig):
     regression_bidirectional: bool = field(
         default=False, metadata={"help": "whether to use bidirectional"}
     )
+    regression_out_activation_fn: str = field(
+        default="tanh",
+        metadata={"help": " activation function of regression output"},
+    )
+    grad_norm: bool = field(default=False, metadata={"help": "apply gradnorm to model"})
 
 
 @dataclass
-class Wav2Vec2SeqSeldAudioFrameClassLSTMConfig(Wav2Vec2SeldAudioFrameClassLSTMConfig):
+class Wav2Vec2SeqSeldAudioFrameClassRNNConfig(Wav2Vec2SeldAudioFrameClassRNNConfig):
     pass
 
 
@@ -415,21 +543,30 @@ class Wav2Vec2SeldAudioFrameClassConformerConfig(Wav2Vec2SeldConfig):
             "help": ("number of layers to freeze in the pretrained transformer model")
         },
     )
+    use_recurrent_block: bool = field(
+        default=False, metadata={"help": "use recurrent block"}
+    )
+    recurrent: Optional[Wav2Vec2HeaderConfig] = Wav2Vec2HeaderConfig()
     classifier_input_dropout: float = field(
         default=0.0,
         metadata={"help": "dropout of in ClassifierHead applied to input features"},
     )
-    classifier_encoder: Wav2Vec2Config = Wav2Vec2Config()
-    regression_encoder: Wav2Vec2Config = Wav2Vec2Config()
-    target_length: int = field(
-        default=11, metadata={"help": "number of targets in classification"}
-    )
+    classifier_encoder: Wav2Vec2HeaderConfig = Wav2Vec2HeaderConfig()
     regression_input_dropout: float = field(
         default=0.0, metadata={"help": "dropout of proj in ClassifierHead"}
+    )
+    regression_encoder: Wav2Vec2HeaderConfig = Wav2Vec2HeaderConfig()
+    target_length: int = field(
+        default=11, metadata={"help": "number of targets in classification"}
     )
     doa_size: int = field(
         default=3, metadata={"help": "number of DOA in ClassifierHead"}
     )
+    regression_out_activation_fn: str = field(
+        default="tanh",
+        metadata={"help": " activation function of regression output"},
+    )
+    grad_norm: bool = field(default=False, metadata={"help": "apply gradnorm to model"})
 
 
 @dataclass
@@ -554,23 +691,69 @@ class Wav2vec2SeqSeldAudioFrameClassTCNEncoder(Wav2vecSeqClass):
 
 
 @register_model(
-    "wav2vec2_seld_audio_frame_class_lstm",
-    dataclass=Wav2Vec2SeqSeldAudioFrameClassLSTMConfig,
+    "wav2vec2_seld_audio_frame_class_inception_time",
+    dataclass=Wav2Vec2SeqSeldAudioFrameClassInceptionTimeConfig,
 )
-class Wav2vec2SeqSeldAudioFrameClassLSTMEncoder(Wav2vecSeqClass):
+class Wav2vec2SeqSeldAudioFrameClassInceptionTimeEncoder(Wav2vecSeqClass):
     def __init__(
         self,
-        cfg: Wav2Vec2SeqSeldAudioFrameClassLSTMConfig,
+        cfg: Wav2Vec2SeqSeldAudioFrameClassInceptionTimeConfig,
         w2v_encoder: BaseFairseqModel,
     ):
         super().__init__(cfg, w2v_encoder)
 
     @classmethod
     def build_model(
-        cls, cfg: Wav2Vec2SeqSeldAudioFrameClassLSTMConfig, task: FairseqTask
+        cls, cfg: Wav2Vec2SeqSeldAudioFrameClassInceptionTimeConfig, task: FairseqTask
     ):
         """Build a new model instance."""
-        w2v_encoder = Wav2vec2SeldAudioFrameClassLSTMEncoder(cfg, cfg.target_length)
+        w2v_encoder = Wav2vec2SeldAudioFrameClassInceptionTimeEncoder(
+            cfg, cfg.target_length
+        )
+        return cls(cfg, w2v_encoder)
+
+
+@register_model(
+    "wav2vec2_seld_audio_frame_class_mstcn",
+    dataclass=Wav2Vec2SeqSeldAudioFrameClassMultiScaleTCNConfig,
+)
+class Wav2vec2SeqSeldAudioFrameClassMultiScaleTCNEncoder(Wav2vecSeqClass):
+    def __init__(
+        self,
+        cfg: Wav2Vec2SeqSeldAudioFrameClassMultiScaleTCNConfig,
+        w2v_encoder: BaseFairseqModel,
+    ):
+        super().__init__(cfg, w2v_encoder)
+
+    @classmethod
+    def build_model(
+        cls, cfg: Wav2Vec2SeqSeldAudioFrameClassMultiScaleTCNConfig, task: FairseqTask
+    ):
+        """Build a new model instance."""
+        w2v_encoder = Wav2vec2SeldAudioFrameClassMultiScaleTcnEncoder(
+            cfg, cfg.target_length
+        )
+        return cls(cfg, w2v_encoder)
+
+
+@register_model(
+    "wav2vec2_seld_audio_frame_class_rnn",
+    dataclass=Wav2Vec2SeqSeldAudioFrameClassRNNConfig,
+)
+class Wav2vec2SeqSeldAudioFrameClassRNNEncoder(Wav2vecSeqClass):
+    def __init__(
+        self,
+        cfg: Wav2Vec2SeqSeldAudioFrameClassRNNConfig,
+        w2v_encoder: BaseFairseqModel,
+    ):
+        super().__init__(cfg, w2v_encoder)
+
+    @classmethod
+    def build_model(
+        cls, cfg: Wav2Vec2SeqSeldAudioFrameClassRNNConfig, task: FairseqTask
+    ):
+        """Build a new model instance."""
+        w2v_encoder = Wav2vec2SeldAudioFrameClassRNNEncoder(cfg, cfg.target_length)
         return cls(cfg, w2v_encoder)
 
 
@@ -778,7 +961,7 @@ class Wav2vec2AudioFrameClassHead(nn.Module):
             self.out_proj = torch.nn.Linear(inner_dims[-1], num_outs)
             self.out_activation_fn = utils.get_activation_fn(out_activation_fn)
 
-    def forward(self, features, **kwargs):
+    def forward(self, features, padding_mask=None):
         if self.layer_norm_first:
             features = self.layer_norm(features)
         x = self.dropout_input(features)
@@ -797,7 +980,7 @@ class Wav2vec2AudioFrameClassHead(nn.Module):
 
 class Wav2vec2AudioFrameClassTCNHead(nn.Module):
     """
-    Head for audioframe classification tasks. It does not have the pooler that
+    Head for audioframe classification tasks using TCN. It does not have the pooler that
     computes the mean of embeddings along the timesteps
 
     It produces outputs of size (B, T, N)
@@ -807,37 +990,130 @@ class Wav2vec2AudioFrameClassTCNHead(nn.Module):
     def __init__(
         self,
         input_dim,
-        inner_channels,
-        num_outs,
         dropout_input,
-        dropout,
-        kernel_size,
-        mode,
-        activation_fn,
+        bidirectional,
+        merge_cat,
+        attention,
+        att_type,
+        cfg,
+        num_outs,
+        out_activation_fn,
     ):
         super().__init__()
 
         self.dropout_input = nn.Dropout(p=dropout_input)
+        self.bidirectional = bidirectional
+        self.merge_cat = merge_cat
 
-        self.tcn = TemporalConvNet(
-            num_inputs=input_dim,
-            num_channels=inner_channels,
-            kernel_size=kernel_size,
-            dropout=dropout,
-            mode=mode,
-            activation_fn=activation_fn,
-        )
+        cfg.num_inputs = input_dim
 
-        self.out_proj = torch.nn.Linear(inner_channels[-1], num_outs)
+        if self.bidirectional and self.merge_cat:
+            embed_dim = 2 * cfg["num_channels"][-1]
+        else:
+            embed_dim = cfg["num_channels"][-1]
 
-    def forward(self, features, **kwargs):
+        self.tcn = TemporalConvNet(cfg)
+
+        if self.bidirectional:
+            self.tcn_r = TemporalConvNet(cfg)
+
+        self.att_type = att_type
+        if attention:
+            if self.att_type == "self-attention":
+                self.attn = nn.MultiheadAttention(embed_dim, 8, batch_first=True)
+            elif self.att_type == "local-aware-attention":
+                self.attn = LocationAwareAttention(embed_dim)
+            else:
+                self.attn = BahdanauAttention(embed_dim)
+        else:
+            self.attn = None
+
+        self.out_proj = torch.nn.Linear(embed_dim, num_outs)
+        self.out_activation_fn = utils.get_activation_fn(out_activation_fn)
+
+    def forward(self, features, padding_mask=None):
         x = self.dropout_input(features)
-        x = self.tcn(x.transpose(1, 2)).transpose(1, 2)
+        r = self.tcn(x)
+
+        if self.bidirectional:
+            x_rl = torch.flip(x, [1])  # reverse T dimension
+            r_rl = self.tcn_r(x_rl)
+            r_rl = torch.flip(r_rl, [1])  # return T again
+            if self.merge_cat:
+                r = torch.cat((r, r_rl), dim=-1)
+            else:
+                r = r + r_rl
+
+        if self.attn is not None:
+            if self.att_type == "self-attention":
+                if padding_mask is not None:
+                    B, T = padding_mask.shape
+                    mask = padding_mask.unsqueeze(1).expand(B, T, T)
+                    mask = mask.repeat(8, 1, 1)
+                else:
+                    mask = padding_mask
+                r, _ = self.attn(r, r, r, attn_mask=mask)
+            else:
+                _, weights = self.attn(r, r, mask=padding_mask)
+                weights = weights.squeeze(1).unsqueeze(-1)
+                r = r * weights
+
+        r = self.out_proj(r)
+        r = self.out_activation_fn(r)
+        return r
+
+
+class Wav2vec2AudioFrameClassInceptionTimeHead(nn.Module):
+    """
+    Head for audioframe classification tasks with InceptionTime.
+
+    It produces outputs of size (B, T, N)
+
+    """
+
+    def __init__(
+        self,
+        input_dim,
+        filters,
+        depth,
+        num_outs,
+        activation_fn,
+        out_activation_fn,
+        dropout_input,
+        dropout,
+        bn,
+        layer_norm_first,
+    ):
+        super().__init__()
+
+        self.layer_norm_first = layer_norm_first
+        if layer_norm_first:
+            self.layer_norm = LayerNorm(input_dim)
+
+        self.dropout_input = nn.Dropout(p=dropout_input)
+
+        self.inception_time = InceptionTimeModel(
+            input_size=input_dim,
+            filters=filters,
+            depth=depth,
+            activation_fn=activation_fn,
+            batch_norm=bn,
+            dropout=dropout,
+        )
+        self.out_proj = torch.nn.Linear(4 * filters, num_outs)
+        self.out_activation_fn = utils.get_activation_fn(out_activation_fn)
+
+    def forward(self, features, padding_mask=None):
+        if self.layer_norm_first:
+            features = self.layer_norm(features)
+        x = self.dropout_input(features)
+        x = self.inception_time(x)
         x = self.out_proj(x)
+        x = self.out_activation_fn(x)
         return x
 
 
-class Wav2vec2AudioFrameClassLSTMHead(nn.Module):
+class Wav2vec2AudioFrameClassRNNHead(nn.Module):
     """
     Head for audioframe classification tasks. It does not have the pooler that
     computes the mean of embeddings along the timesteps
@@ -848,6 +1124,7 @@ class Wav2vec2AudioFrameClassLSTMHead(nn.Module):
 
     def __init__(
         self,
+        layer_type,
         input_dim,
         hidden_size,
         inner_dim,
@@ -855,24 +1132,22 @@ class Wav2vec2AudioFrameClassLSTMHead(nn.Module):
         num_outs,
         activation_fn,
         dropout_input,
-        dropout_lstm,
+        dropout_rnn,
         dropout,
         bidirectional,
+        out_activation_fn,
     ):
         super().__init__()
 
-        tgt_dict = DummyDictionary(vocab_size=num_outs)
-
-        self.lstm_enc = LSTMEncoder3D(
-            dictionary=tgt_dict,
+        self.rnn_encoder = RNNEncoder3D(
+            layer_type=layer_type,
             embed_dim=input_dim,
             hidden_size=hidden_size,
             num_layers=num_layers,
             dropout_in=dropout_input,
-            dropout_out=dropout_lstm,
+            dropout_out=dropout_rnn,
             bidirectional=bidirectional,
             left_pad=False,
-            pretrained_embed=nn.Identity(),  # disable embeddings
         )
 
         if inner_dim == 0:
@@ -886,6 +1161,7 @@ class Wav2vec2AudioFrameClassLSTMHead(nn.Module):
         else:
             self.activation_fn = utils.get_activation_fn(activation_fn)
             self.out_proj = torch.nn.Linear(inner_dim, num_outs)
+            self.out_activation_fn = utils.get_activation_fn(out_activation_fn)
 
     def forward(self, features, padding_mask):
         if padding_mask is None:
@@ -895,7 +1171,7 @@ class Wav2vec2AudioFrameClassLSTMHead(nn.Module):
 
         input_lengths, _ = (1 - padding_mask.long()).sum(-1).sort(descending=True)
 
-        x, _, _ = self.lstm_enc(features, src_lengths=input_lengths)
+        x, _, _ = self.rnn_encoder(features, src_lengths=input_lengths)
 
         # T x B x C -> B x T x C
         x = x.transpose(0, 1)
@@ -906,6 +1182,7 @@ class Wav2vec2AudioFrameClassLSTMHead(nn.Module):
             x = self.dropout(x)
 
         x = self.out_proj(x)
+        x = self.out_activation_fn(x)
         return x
 
 
@@ -914,24 +1191,44 @@ class ConformerFrameHead(nn.Module):
 
     def __init__(
         self,
+        input_dim,
+        dropout_input,
         cfg,
         num_outs,
-        dropout_input,
+        out_activation_fn="linear",
     ):
         super().__init__()
-
+        if input_dim != cfg.encoder_embed_dim:
+            self.input_proj = torch.nn.Linear(input_dim, cfg.encoder_embed_dim)
+        else:
+            self.input_proj = None
         self.dropout_input = nn.Dropout(p=dropout_input)
+        encoder_cls = TransformerEncoderHeader
+        if cfg.layer_type == "conformer" and cfg.pos_enc_type in ["rel_pos", "rope"]:
+            encoder_cls = ConformerEncoderHeader
 
-        self.transf_enc = ConformerEncoder(cfg)
+        self.encoder = encoder_cls(cfg)
 
-        self.out_proj = torch.nn.Linear(cfg.encoder_embed_dim, num_outs)
+        # assert self.encoder.layer_norm_first is True
 
-    def forward(self, features, padding_mask, **kwargs):
+        # fix SiLU activations to false
+        SiLU_inplace_to_False(self.encoder)
+
+        self.num_outs = num_outs
+        if self.num_outs is not None:
+            self.out_proj = torch.nn.Linear(cfg.encoder_embed_dim, num_outs)
+            self.out_activation_fn = utils.get_activation_fn(out_activation_fn)
+
+    def forward(self, features, padding_mask):
+        if self.input_proj:
+            features = self.input_proj(features)
         x = self.dropout_input(features)
 
-        x, _ = self.transf_enc(x, padding_mask=padding_mask, layer=None)
+        x, _ = self.encoder(x, padding_mask=padding_mask)
 
-        x = self.out_proj(x)
+        if self.num_outs is not None:
+            x = self.out_proj(x)
+            x = self.out_activation_fn(x)
         return x
 
 
@@ -1232,12 +1529,16 @@ class Wav2vec2SeldAudioFrameClassEncoder(Wav2vec2SequenceClassEncoder):
         self.freeze_finetune_updates = cfg.freeze_finetune_updates
         self.num_updates = 0
 
-        # if cfg.grad_norm:
-        #     self.final_proj = nn.Linear(
-        #         cfg.encoder_embed_dim, cfg.encoder_embed_dim)
+        if cfg.use_recurrent_block:
+            cfg.recurrent.num_inputs = d
+            self.recurrent = TemporalConvNet(cfg.recurrent)
+            num_channels = cfg.recurrent.num_channels
+            d = num_channels[-1]
 
-        #     for p in self.final_proj.parameters():
-        #         p.param_group = "w2v_model"
+            for p in self.recurrent.parameters():
+                p.param_group = "recurrent"
+        else:
+            self.recurrent = None
 
         self.classifier_head = Wav2vec2AudioFrameClassHead(
             input_dim=d,
@@ -1273,7 +1574,15 @@ class Wav2vec2SeldAudioFrameClassEncoder(Wav2vec2SequenceClassEncoder):
             self.weights.param_group = "weights_grad_norm"
 
     def get_last_shared_layer(self):
-        return self.w2v_model.encoder.layers[-1]
+        if self.recurrent is None:
+            last_shared_layer = self.w2v_model.encoder.layers[-1]
+        else:
+            if hasattr(self.recurrent.encoder, "layers"):
+                # last_shared_layer = self.recurrent.out_proj
+                last_shared_layer = self.recurrent.encoder.layers[-1]
+            else:
+                last_shared_layer = self.recurrent.encoder[-1]
+        return last_shared_layer
 
     def forward(self, source, padding_mask, **kwargs):
         w2v_args = {
@@ -1290,12 +1599,13 @@ class Wav2vec2SeldAudioFrameClassEncoder(Wav2vec2SequenceClassEncoder):
             x = res["x"]
             padding_mask = res["padding_mask"]
 
-        # if self.cfg.grad_norm:
-        #     x = self.final_proj(x)
         x = self.final_dropout(x)
 
-        class_logits = self.classifier_head(x)
-        regression_logits = self.regression_head(x)
+        if self.recurrent is not None:
+            x = self.recurrent(x, padding_mask)
+
+        class_logits = self.classifier_head(x, padding_mask)
+        regression_logits = self.regression_head(x, padding_mask)
 
         return {
             "class_encoder_out": class_logits,  # B x T x N
@@ -1397,15 +1707,27 @@ class Wav2vec2SeldAudioFrameClassTCNEncoder(Wav2vec2SeldAudioFrameClassEncoder):
         self.freeze_finetune_updates = cfg.freeze_finetune_updates
         self.num_updates = 0
 
+        if cfg.use_recurrent_block:
+            cfg.recurrent.num_inputs = d
+            self.recurrent = TemporalConvNet(cfg.recurrent)
+            num_channels = cfg.recurrent.num_channels
+            d = num_channels[-1]
+
+            for p in self.recurrent.parameters():
+                p.param_group = "recurrent"
+        else:
+            self.recurrent = None
+
         self.classifier_head = Wav2vec2AudioFrameClassTCNHead(
             input_dim=d,
-            inner_channels=cfg.classifier_inner_channels,
-            num_outs=tgt_len,
             dropout_input=cfg.classifier_input_dropout,
-            dropout=cfg.classifier_dropout,
-            kernel_size=cfg.classifier_kernel_size,
-            activation_fn=cfg.classifier_activation_fn,
-            mode=cfg.classifier_norm_mode,
+            cfg=cfg.classifier_tcn,
+            attention=cfg.attention,
+            att_type=cfg.att_type,
+            bidirectional=cfg.bidirectional,
+            merge_cat=cfg.merge_cat,
+            num_outs=tgt_len,
+            out_activation_fn="linear",
         )
 
         for p in self.classifier_head.parameters():
@@ -1413,29 +1735,36 @@ class Wav2vec2SeldAudioFrameClassTCNEncoder(Wav2vec2SeldAudioFrameClassEncoder):
 
         self.regression_head = Wav2vec2AudioFrameClassTCNHead(
             input_dim=d,
-            inner_channels=cfg.regression_inner_channels,
-            num_outs=tgt_len * cfg.doa_size,
             dropout_input=cfg.regression_input_dropout,
-            dropout=cfg.regression_dropout,
-            kernel_size=cfg.regression_kernel_size,
-            activation_fn=cfg.regression_activation_fn,
-            mode=cfg.regression_norm_mode,
+            cfg=cfg.regression_tcn,
+            attention=cfg.attention,
+            att_type=cfg.att_type,
+            bidirectional=cfg.bidirectional,
+            merge_cat=cfg.merge_cat,
+            num_outs=tgt_len * cfg.doa_size,
+            out_activation_fn=cfg.regression_out_activation_fn,
         )
 
         for p in self.regression_head.parameters():
             p.param_group = "regression_head"
 
+        if cfg.grad_norm:
+            # assign the weights for each task
+            self.weights = torch.nn.Parameter(torch.ones(2).float())
+            self.weights.param_group = "weights_grad_norm"
 
-class Wav2vec2SeldAudioFrameClassLSTMEncoder(Wav2vec2SequenceClassEncoder):
+
+class Wav2vec2SeldAudioFrameClassInceptionTimeEncoder(
+    Wav2vec2SeldAudioFrameClassEncoder
+):
     """
     Similar to Wav2Vec2ForAudioFrameClassification
     https://huggingface.co/docs/transformers/model_doc/wav2vec2#transformers.Wav2Vec2ForAudioFrameClassification
 
-    Wav2Vec2 Model with a frame classification head on top for tasks like
-    Speaker Diarization.
+    but with InceptionTime header
     """
 
-    def __init__(self, cfg: Wav2Vec2SeldAudioFrameClassLSTMConfig, tgt_len=1):
+    def __init__(self, cfg: Wav2Vec2SeldAudioFrameClassInceptionTimeConfig, tgt_len=1):
         self.apply_mask = cfg.apply_mask
         self.cfg = cfg
 
@@ -1519,67 +1848,324 @@ class Wav2vec2SeldAudioFrameClassLSTMEncoder(Wav2vec2SequenceClassEncoder):
         self.freeze_finetune_updates = cfg.freeze_finetune_updates
         self.num_updates = 0
 
-        self.classifier_head = Wav2vec2AudioFrameClassLSTMHead(
+        if cfg.use_recurrent_block:
+            cfg.recurrent.num_inputs = d
+            self.recurrent = TemporalConvNet(cfg.recurrent)
+            num_channels = cfg.recurrent.num_channels
+            d = num_channels[-1]
+
+            for p in self.recurrent.parameters():
+                p.param_group = "recurrent"
+        else:
+            self.recurrent = None
+
+        self.classifier_head = Wav2vec2AudioFrameClassInceptionTimeHead(
             input_dim=d,
-            hidden_size=cfg.classifier_hidden_size,
-            inner_dim=cfg.classifier_proj_size,
-            num_layers=cfg.classifier_num_layers,
-            num_outs=cfg.target_length,
-            activation_fn=cfg.classifier_activation_fn,
+            layer_norm_first=cfg.layer_norm_first,
             dropout_input=cfg.classifier_input_dropout,
-            dropout_lstm=cfg.classifier_dropout_lstm,
+            filters=cfg.classifier_filters,
+            depth=cfg.classifier_depth,
+            num_outs=tgt_len,
+            activation_fn=cfg.classifier_activation_fn,
             dropout=cfg.classifier_dropout,
-            bidirectional=cfg.classifier_bidirectional,
+            bn=cfg.classifier_bn,
+            out_activation_fn="linear",
         )
 
         for p in self.classifier_head.parameters():
             p.param_group = "classifier_head"
 
-        self.regression_head = Wav2vec2AudioFrameClassLSTMHead(
+        self.regression_head = Wav2vec2AudioFrameClassInceptionTimeHead(
             input_dim=d,
-            hidden_size=cfg.regression_hidden_size,
-            inner_dim=cfg.regression_proj_size,
-            num_layers=cfg.regression_num_layers,
-            num_outs=cfg.target_length * cfg.doa_size,
-            activation_fn=cfg.regression_activation_fn,
+            layer_norm_first=cfg.layer_norm_first,
             dropout_input=cfg.regression_input_dropout,
-            dropout_lstm=cfg.regression_dropout_lstm,
+            filters=cfg.regression_filters,
+            depth=cfg.regression_depth,
+            num_outs=tgt_len * cfg.doa_size,
+            activation_fn=cfg.regression_activation_fn,
             dropout=cfg.regression_dropout,
-            bidirectional=cfg.regression_bidirectional,
+            bn=cfg.regression_bn,
+            out_activation_fn=cfg.regression_out_activation_fn,
         )
 
         for p in self.regression_head.parameters():
             p.param_group = "regression_head"
 
-    def forward(self, source, padding_mask, **kwargs):
-        w2v_args = {
-            "source": source,
-            "padding_mask": padding_mask,
-            "mask": self.apply_mask and self.training,
+        if cfg.grad_norm:
+            # assign the weights for each task
+            self.weights = torch.nn.Parameter(torch.ones(2).float())
+            self.weights.param_group = "weights_grad_norm"
+
+
+class Wav2vec2SeldAudioFrameClassMultiScaleTcnEncoder(
+    Wav2vec2SeldAudioFrameClassEncoder
+):
+    """
+    Similar to Wav2Vec2ForAudioFrameClassification
+    https://huggingface.co/docs/transformers/model_doc/wav2vec2#transformers.Wav2Vec2ForAudioFrameClassification
+
+    but with InceptionTime header
+    """
+
+    def __init__(self, cfg: Wav2Vec2SeldAudioFrameClassMultiScaleTCNConfig, tgt_len=1):
+        self.apply_mask = cfg.apply_mask
+        self.cfg = cfg
+
+        arg_overrides = {
+            "conv_feature_layers": cfg.conv_feature_layers,
+            "in_channels": cfg.in_channels,
+            "in_conv_groups": cfg.in_conv_groups,
+            "dropout": cfg.dropout,
+            "activation_dropout": cfg.activation_dropout,
+            "dropout_input": cfg.dropout_input,
+            "attention_dropout": cfg.attention_dropout,
+            "mask_length": cfg.mask_length,
+            "mask_prob": cfg.mask_prob,
+            "mask_selection": cfg.mask_selection,
+            "mask_other": cfg.mask_other,
+            "no_mask_overlap": cfg.no_mask_overlap,
+            "mask_channel_length": cfg.mask_channel_length,
+            "mask_channel_prob": cfg.mask_channel_prob,
+            "mask_channel_selection": cfg.mask_channel_selection,
+            "mask_channel_other": cfg.mask_channel_other,
+            "no_mask_channel_overlap": cfg.no_mask_channel_overlap,
+            "encoder_layerdrop": cfg.layerdrop,
+            "feature_grad_mult": cfg.feature_grad_mult,
         }
 
-        ft = self.freeze_finetune_updates <= self.num_updates
+        if cfg.w2v_args is None:
+            state = checkpoint_utils.load_checkpoint_to_cpu(cfg.w2v_path, arg_overrides)
+            w2v_args = state.get("cfg", None)
+            if w2v_args is None:
+                w2v_args = convert_namespace_to_omegaconf(state["args"])
+            w2v_args.criterion = None
+            w2v_args.lr_scheduler = None
+            cfg.w2v_args = w2v_args
 
-        with torch.no_grad() if not ft else contextlib.ExitStack():
-            res = self.w2v_model.extract_features(**w2v_args)
+            logger.info(w2v_args)
 
-            x = res["x"]
-            padding_mask = res["padding_mask"]
+        else:
+            state = None
+            w2v_args = cfg.w2v_args
+            if isinstance(w2v_args, Namespace):
+                cfg.w2v_args = w2v_args = convert_namespace_to_omegaconf(w2v_args)
 
-        x = self.final_dropout(x)
+        model_normalized = w2v_args.task.get(
+            "normalize", w2v_args.model.get("normalize", False)
+        )
+        assert cfg.normalize == model_normalized, (
+            "Fine-tuning works best when data normalization is the same. "
+            "Please check that --normalize is set or unset for both"
+            "pre-training and here"
+        )
 
-        class_logits = self.classifier_head(x, padding_mask)
-        regression_logits = self.regression_head(x, padding_mask)
+        if hasattr(cfg, "checkpoint_activations") and cfg.checkpoint_activations:
+            with open_dict(w2v_args):
+                w2v_args.model.checkpoint_activations = cfg.checkpoint_activations
 
-        return {
-            "class_encoder_out": class_logits,  # B x T x N
-            "regression_out": regression_logits,  # B x T x doa_size*N
-            "encoder_padding_mask": padding_mask,  # B x T
-            "padding_mask": padding_mask,  # B x T
+        w2v_args.task.data = cfg.data
+        task = tasks.setup_task(w2v_args.task)
+        model = task.build_model(w2v_args.model, from_checkpoint=True)
+
+        if cfg.remove_pretrained_modules:
+            model.remove_pretraining_modules()
+
+        if state is not None and not cfg.no_pretrained_weights:
+            self.load_model_weights(state, model, cfg)
+
+        FairseqEncoder.__init__(self, task.source_dictionary)
+
+        d = w2v_args.model.encoder_embed_dim
+
+        self.w2v_model = model
+
+        if cfg.n_trans_layers_to_freeze > 0:
+            for layer in range(cfg.n_trans_layers_to_freeze):
+                freeze_module_params(self.w2v_model.encoder.layers[layer])
+                logger.info(f"freezed w2v_model.encoder layer: {layer}")
+
+        for p in self.w2v_model.parameters():
+            p.param_group = "w2v_model"
+
+        self.final_dropout = nn.Dropout(cfg.final_dropout)
+        self.freeze_finetune_updates = cfg.freeze_finetune_updates
+        self.num_updates = 0
+
+        if cfg.use_recurrent_block:
+            cfg.recurrent.num_inputs = d
+            self.recurrent = TemporalConvNet(cfg.recurrent)
+            num_channels = cfg.recurrent.num_channels
+            d = num_channels[-1]
+
+            for p in self.recurrent.parameters():
+                p.param_group = "recurrent"
+        else:
+            self.recurrent = None
+
+        self.classifier_head = Wav2vec2AudioFrameClassMultiScaleTcnHead(
+            input_dim=d,
+            dropout_input=cfg.classifier_input_dropout,
+            num_outs=tgt_len,
+            out_activation_fn="linear",
+            cfg=cfg.classifier
+        )
+
+        for p in self.classifier_head.parameters():
+            p.param_group = "classifier_head"
+
+        self.regression_head = Wav2vec2AudioFrameClassMultiScaleTcnHead(
+            input_dim=d,
+            dropout_input=cfg.regression_input_dropout,
+            num_outs=tgt_len * cfg.doa_size,
+            out_activation_fn=cfg.regression_out_activation_fn,
+            cfg=cfg.regression
+        )
+
+        for p in self.regression_head.parameters():
+            p.param_group = "regression_head"
+
+        if cfg.grad_norm:
+            # assign the weights for each task
+            self.weights = torch.nn.Parameter(torch.ones(2).float())
+            self.weights.param_group = "weights_grad_norm"
+
+
+class Wav2vec2SeldAudioFrameClassRNNEncoder(Wav2vec2SeldAudioFrameClassEncoder):
+    """
+    Similar to Wav2Vec2ForAudioFrameClassification
+    https://huggingface.co/docs/transformers/model_doc/wav2vec2#transformers.Wav2Vec2ForAudioFrameClassification
+
+    Wav2Vec2 Model with a frame classification head on top for tasks like
+    Speaker Diarization.
+    """
+
+    def __init__(self, cfg: Wav2Vec2SeldAudioFrameClassRNNConfig, tgt_len=1):
+        self.apply_mask = cfg.apply_mask
+        self.cfg = cfg
+
+        arg_overrides = {
+            "conv_feature_layers": cfg.conv_feature_layers,
+            "in_channels": cfg.in_channels,
+            "in_conv_groups": cfg.in_conv_groups,
+            "dropout": cfg.dropout,
+            "activation_dropout": cfg.activation_dropout,
+            "dropout_input": cfg.dropout_input,
+            "attention_dropout": cfg.attention_dropout,
+            "mask_length": cfg.mask_length,
+            "mask_prob": cfg.mask_prob,
+            "mask_selection": cfg.mask_selection,
+            "mask_other": cfg.mask_other,
+            "no_mask_overlap": cfg.no_mask_overlap,
+            "mask_channel_length": cfg.mask_channel_length,
+            "mask_channel_prob": cfg.mask_channel_prob,
+            "mask_channel_selection": cfg.mask_channel_selection,
+            "mask_channel_other": cfg.mask_channel_other,
+            "no_mask_channel_overlap": cfg.no_mask_channel_overlap,
+            "encoder_layerdrop": cfg.layerdrop,
+            "feature_grad_mult": cfg.feature_grad_mult,
         }
 
+        if cfg.w2v_args is None:
+            state = checkpoint_utils.load_checkpoint_to_cpu(cfg.w2v_path, arg_overrides)
+            w2v_args = state.get("cfg", None)
+            if w2v_args is None:
+                w2v_args = convert_namespace_to_omegaconf(state["args"])
+            w2v_args.criterion = None
+            w2v_args.lr_scheduler = None
+            cfg.w2v_args = w2v_args
 
-class Wav2vec2SeldAudioFrameClassConformerEncoder(Wav2vec2SequenceClassEncoder):
+            logger.info(w2v_args)
+
+        else:
+            state = None
+            w2v_args = cfg.w2v_args
+            if isinstance(w2v_args, Namespace):
+                cfg.w2v_args = w2v_args = convert_namespace_to_omegaconf(w2v_args)
+
+        model_normalized = w2v_args.task.get(
+            "normalize", w2v_args.model.get("normalize", False)
+        )
+        assert cfg.normalize == model_normalized, (
+            "Fine-tuning works best when data normalization is the same. "
+            "Please check that --normalize is set or unset for both"
+            "pre-training and here"
+        )
+
+        if hasattr(cfg, "checkpoint_activations") and cfg.checkpoint_activations:
+            with open_dict(w2v_args):
+                w2v_args.model.checkpoint_activations = cfg.checkpoint_activations
+
+        w2v_args.task.data = cfg.data
+        task = tasks.setup_task(w2v_args.task)
+        model = task.build_model(w2v_args.model, from_checkpoint=True)
+
+        if cfg.remove_pretrained_modules:
+            model.remove_pretraining_modules()
+
+        if state is not None and not cfg.no_pretrained_weights:
+            self.load_model_weights(state, model, cfg)
+
+        FairseqEncoder.__init__(self, task.source_dictionary)
+
+        d = w2v_args.model.encoder_embed_dim
+
+        self.w2v_model = model
+
+        if cfg.n_trans_layers_to_freeze > 0:
+            for layer in range(cfg.n_trans_layers_to_freeze):
+                freeze_module_params(self.w2v_model.encoder.layers[layer])
+                logger.info(f"freezed w2v_model.encoder layer: {layer}")
+
+        for p in self.w2v_model.parameters():
+            p.param_group = "w2v_model"
+
+        self.final_dropout = nn.Dropout(cfg.final_dropout)
+        self.freeze_finetune_updates = cfg.freeze_finetune_updates
+        self.num_updates = 0
+
+        self.classifier_head = Wav2vec2AudioFrameClassRNNHead(
+            layer_type=cfg.layer_type,
+            input_dim=d,
+            hidden_size=cfg.classifier_hidden_size,
+            inner_dim=cfg.classifier_proj_size,
+            num_layers=cfg.classifier_num_layers,
+            num_outs=tgt_len,
+            activation_fn=cfg.classifier_activation_fn,
+            dropout_input=cfg.classifier_input_dropout,
+            dropout_rnn=cfg.classifier_dropout,
+            dropout=cfg.classifier_dropout,
+            bidirectional=cfg.classifier_bidirectional,
+            out_activation_fn="linear",
+        )
+
+        for p in self.classifier_head.parameters():
+            p.param_group = "classifier_head"
+
+        self.regression_head = Wav2vec2AudioFrameClassRNNHead(
+            layer_type=cfg.layer_type,
+            input_dim=d,
+            hidden_size=cfg.regression_hidden_size,
+            inner_dim=cfg.regression_proj_size,
+            num_layers=cfg.regression_num_layers,
+            num_outs=tgt_len * cfg.doa_size,
+            activation_fn=cfg.regression_activation_fn,
+            dropout_input=cfg.regression_input_dropout,
+            dropout_rnn=cfg.regression_dropout,
+            dropout=cfg.regression_dropout,
+            bidirectional=cfg.regression_bidirectional,
+            out_activation_fn=cfg.regression_out_activation_fn,
+        )
+
+        for p in self.regression_head.parameters():
+            p.param_group = "regression_head"
+
+        if cfg.grad_norm:
+            # assign the weights for each task
+            self.weights = torch.nn.Parameter(torch.ones(2).float())
+            self.weights.param_group = "weights_grad_norm"
+
+
+class Wav2vec2SeldAudioFrameClassConformerEncoder(Wav2vec2SeldAudioFrameClassEncoder):
     """
     Similar to Wav2Vec2ForAudioFrameClassification
     https://huggingface.co/docs/transformers/model_doc/wav2vec2#transformers.Wav2Vec2ForAudioFrameClassification
@@ -1656,7 +2242,7 @@ class Wav2vec2SeldAudioFrameClassConformerEncoder(Wav2vec2SequenceClassEncoder):
 
         FairseqEncoder.__init__(self, task.source_dictionary)
 
-        # d = w2v_args.model.encoder_embed_dim
+        d = w2v_args.model.encoder_embed_dim
 
         self.w2v_model = model
 
@@ -1672,50 +2258,47 @@ class Wav2vec2SeldAudioFrameClassConformerEncoder(Wav2vec2SequenceClassEncoder):
         self.freeze_finetune_updates = cfg.freeze_finetune_updates
         self.num_updates = 0
 
+        if cfg.use_recurrent_block:
+            self.recurrent = ConformerFrameHead(
+                input_dim=d,
+                dropout_input=0.0,
+                cfg=cfg.recurrent,
+                num_outs=None,
+                out_activation_fn="linear",
+            )
+            d = cfg.recurrent.encoder_embed_dim
+
+            for p in self.recurrent.parameters():
+                p.param_group = "recurrent"
+        else:
+            self.recurrent = None
+
         self.classifier_head = ConformerFrameHead(
+            input_dim=d,
+            dropout_input=cfg.classifier_input_dropout,
             cfg=cfg.classifier_encoder,
             num_outs=tgt_len,
-            dropout_input=cfg.classifier_input_dropout,
+            out_activation_fn="linear",
         )
 
         for p in self.classifier_head.parameters():
             p.param_group = "classifier_head"
 
         self.regression_head = ConformerFrameHead(
+            input_dim=d,
+            dropout_input=cfg.regression_input_dropout,
             cfg=cfg.regression_encoder,
             num_outs=tgt_len * cfg.doa_size,
-            dropout_input=cfg.regression_input_dropout,
+            out_activation_fn=cfg.regression_out_activation_fn,
         )
 
         for p in self.regression_head.parameters():
             p.param_group = "regression_head"
 
-    def forward(self, source, padding_mask, **kwargs):
-        w2v_args = {
-            "source": source,
-            "padding_mask": padding_mask,
-            "mask": self.apply_mask and self.training,
-        }
-
-        ft = self.freeze_finetune_updates <= self.num_updates
-
-        with torch.no_grad() if not ft else contextlib.ExitStack():
-            res = self.w2v_model.extract_features(**w2v_args)
-
-            x = res["x"]
-            padding_mask = res["padding_mask"]
-
-        x = self.final_dropout(x)
-
-        class_logits = self.classifier_head(x, padding_mask)
-        regression_logits = self.regression_head(x, padding_mask)
-
-        return {
-            "class_encoder_out": class_logits,  # B x T x N
-            "regression_out": regression_logits,  # B x T x doa_size*N
-            "encoder_padding_mask": padding_mask,  # B x T
-            "padding_mask": padding_mask,  # B x T
-        }
+        if cfg.grad_norm:
+            # assign the weights for each task
+            self.weights = torch.nn.Parameter(torch.ones(2).float())
+            self.weights.param_group = "weights_grad_norm"
 
 
 class Wav2vec2SeldAccDoaAudioFrameClassEncoder(Wav2vec2SequenceClassEncoder):
@@ -1848,3 +2431,107 @@ class Wav2vec2SeldAccDoaAudioFrameClassEncoder(Wav2vec2SequenceClassEncoder):
             "encoder_padding_mask": padding_mask,  # B x T
             "padding_mask": padding_mask,  # B x T
         }
+
+
+class BahdanauAttention(nn.Module):
+    def __init__(self, hidden_size):
+        super(BahdanauAttention, self).__init__()
+        self.Wa = nn.Linear(hidden_size, hidden_size)
+        self.Ua = nn.Linear(hidden_size, hidden_size)
+        self.Va = nn.Linear(hidden_size, 1)
+
+    def forward(self, query, keys, mask=None):
+        scores = self.Va(torch.tanh(self.Wa(query) + self.Ua(keys)))
+        scores = scores.squeeze(2).unsqueeze(1)
+
+        if mask is not None:
+            _MASKING_VALUE = -1e30 if query.dtype == torch.float32 else -1e4
+            mask = mask.unsqueeze(1)
+            scores.masked_fill_(mask, _MASKING_VALUE)
+
+        weights = F.softmax(scores, dim=-1)
+        context = torch.bmm(weights, keys)
+
+        return context, weights
+
+
+class LocationAwareAttention(nn.Module):
+    """
+    Applies a location-aware attention mechanism on the output features from the decoder.
+    Location-aware attention proposed in "Attention-Based Models for Speech Recognition" paper.
+    The location-aware attention mechanism is performing well in speech recognition tasks.
+    We refer to implementation of ClovaCall Attention style.
+
+    Args:
+        hidden_dim (int): dimesion of hidden state vector (D)
+        smoothing (bool): flag indication whether to use smoothing or not.
+
+    Inputs: query, value, last_attn, smoothing
+        - **query** (B, T, D): tensor containing the output features from the decoder.
+        - **value** (B, T, D): tensor containing features of the encoded input sequence.
+        - **mask** (B, T): tensor containing features of the encoded input sequence.
+        - **last_attn** (B, T): tensor containing previous timestep`s attention (alignment)
+
+    Returns: output, attn
+        - **output** (B, D): tensor containing the feature from encoder outputs
+        - **attn** (B, T): tensor containing the attention (alignment) from the encoder outputs.
+
+    Reference:
+        - **Attention-Based Models for Speech Recognition**: https://arxiv.org/abs/1506.07503
+        - **ClovaCall**: https://github.com/clovaai/ClovaCall/blob/master/las.pytorch/models/attention.py
+    """
+
+    def __init__(self, hidden_dim: int, smoothing: bool = True) -> None:
+        super(LocationAwareAttention, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.conv1d = nn.Conv1d(
+            in_channels=1, out_channels=hidden_dim, kernel_size=3, padding=1
+        )
+        self.query_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.value_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.score_proj = nn.Linear(hidden_dim, 1, bias=True)
+        self.bias = nn.Parameter(torch.rand(hidden_dim).uniform_(-0.1, 0.1))
+        self.smoothing = smoothing
+
+    def forward(
+        self,
+        query: Tensor,
+        value: Tensor,
+        mask=None,
+        last_attn=None,
+    ) -> Tuple[Tensor, Tensor]:
+        batch_size, hidden_dim, seq_len = query.size(0), query.size(2), value.size(1)
+
+        # Initialize previous attention (alignment) to zeros
+        if last_attn is None:
+            last_attn = value.new_zeros(batch_size, seq_len)
+
+        conv_attn = torch.transpose(self.conv1d(last_attn.unsqueeze(1)), 1, 2)
+        score = self.score_proj(
+            torch.tanh(
+                self.query_proj(query.reshape(-1, hidden_dim)).view(
+                    batch_size, -1, hidden_dim
+                )
+                + self.value_proj(value.reshape(-1, hidden_dim)).view(
+                    batch_size, -1, hidden_dim
+                )
+                + conv_attn
+                + self.bias
+            )
+        ).squeeze(dim=-1)
+
+        if mask is not None:
+            _MASKING_VALUE = -1e30 if query.dtype == torch.float32 else -1e4
+            score.masked_fill_(mask, _MASKING_VALUE)
+
+        if self.smoothing:
+            score = torch.sigmoid(score)
+            attn = torch.div(score, score.sum(dim=-1).unsqueeze(dim=-1))
+        else:
+            attn = F.softmax(score, dim=-1)
+
+        context = torch.bmm(attn.unsqueeze(dim=1), value).squeeze(
+            dim=1
+        )  # Bx1xT X BxTxD => Bx1xD => BxD
+
+        return context, attn
