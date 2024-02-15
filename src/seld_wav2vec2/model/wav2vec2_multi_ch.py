@@ -2,13 +2,17 @@ import logging
 import re
 from argparse import Namespace
 from dataclasses import dataclass, field
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from fairseq import checkpoint_utils
 from fairseq.dataclass.utils import convert_namespace_to_omegaconf
+from fairseq.distributed import fsdp_wrap
 from fairseq.models import BaseFairseqModel, register_model
+from fairseq.models.wav2vec.utils import pad_to_multiple
 from fairseq.models.wav2vec.wav2vec2 import (
     ConformerEncoder,
     TransformerEncoder,
@@ -16,15 +20,25 @@ from fairseq.models.wav2vec.wav2vec2 import (
     Wav2Vec2Model,
 )
 from fairseq.modules import (
+    ESPNETMultiHeadedAttention,
     Fp32GroupNorm,
     Fp32LayerNorm,
     GradMultiply,
     GumbelVectorQuantizer,
     LayerNorm,
+    MultiheadAttention,
+    RelPositionalEncoding,
+    RelPositionMultiHeadedAttention,
+    RotaryPositionMultiHeadedAttention,
     TransposeLast,
 )
-from fairseq.utils import is_xla_tensor
+from fairseq.modules.checkpoint_activations import checkpoint_wrapper
+from fairseq.modules.conformer_layer import ConvolutionModule, FeedForwardModule
+from fairseq.modules.transformer_sentence_encoder import init_bert_params
+from fairseq.utils import index_put, is_xla_tensor
 from omegaconf import II, MISSING, open_dict
+
+from seld_wav2vec2.model.tcn import TemporalResnetBlock
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +56,9 @@ class Wav2Vec2ChConfig(Wav2Vec2Config):
 @dataclass
 class Wav2Vec2ChSpecConfig(Wav2Vec2ChConfig):
     spectrogram_1d: bool = II("task.spectrogram_1d")
+    conv_skip_connection: bool = field(
+        default=False, metadata={"help": "skip connection in CNN"}
+    )
     n_mels: int = II("task.n_mels")
 
 
@@ -68,6 +85,11 @@ class Wav2Vec2ChModel(Wav2Vec2Model):
             conv_groups=cfg.in_conv_groups,
         )
 
+    def remove_pretraining_modules(self, last_layer=None):
+        super().remove_pretraining_modules(last_layer=last_layer)
+        if hasattr(self, "mlm_proj"):
+            self.mlm_proj = None
+
 
 @register_model("wav2vec2_spec_ch", dataclass=Wav2Vec2ChSpecConfig)
 class Wav2Vec2ChSpecModel(Wav2Vec2ChModel):
@@ -84,14 +106,24 @@ class Wav2Vec2ChSpecModel(Wav2Vec2ChModel):
                     torch.tensor(cfg.n_mels)).tolist()
 
         if cfg.spectrogram_1d:
-            self.feature_extractor = ConvFeatureExtractionChModel(
-                in_channels=cfg.in_channels,
-                conv_layers=feature_enc_layers,
-                dropout=0.0,
-                mode=cfg.extractor_mode,
-                conv_bias=cfg.conv_bias,
-                conv_groups=cfg.in_conv_groups,
-            )
+            if cfg.conv_skip_connection:
+                self.feature_extractor = ResnetFeatureExtractionChModel(
+                    in_channels=cfg.in_channels,
+                    conv_layers=feature_enc_layers,
+                    dropout=0.0,
+                    mode=cfg.extractor_mode,
+                    conv_bias=cfg.conv_bias,
+                    conv_groups=cfg.in_conv_groups,
+                )
+            else:
+                self.feature_extractor = ConvFeatureExtractionChModel(
+                    in_channels=cfg.in_channels,
+                    conv_layers=feature_enc_layers,
+                    dropout=0.0,
+                    mode=cfg.extractor_mode,
+                    conv_bias=cfg.conv_bias,
+                    conv_groups=cfg.in_conv_groups,
+                )
         else:
             self.feature_extractor = Conv2DFeatureExtractionChModel(
                 in_channels=cfg.in_channels,
@@ -213,14 +245,24 @@ class Wav2Vec2ChSpecMlmModel(Wav2Vec2ChModel):
                     torch.tensor(cfg.n_mels)).tolist()
 
         if cfg.spectrogram_1d:
-            self.feature_extractor = ConvFeatureExtractionChModel(
-                in_channels=cfg.in_channels,
-                conv_layers=feature_enc_layers,
-                dropout=0.0,
-                mode=cfg.extractor_mode,
-                conv_bias=cfg.conv_bias,
-                conv_groups=cfg.in_conv_groups,
-            )
+            if cfg.conv_skip_connection:
+                self.feature_extractor = ResnetFeatureExtractionChModel(
+                    in_channels=cfg.in_channels,
+                    conv_layers=feature_enc_layers,
+                    dropout=0.0,
+                    mode=cfg.extractor_mode,
+                    conv_bias=cfg.conv_bias,
+                    conv_groups=cfg.in_conv_groups,
+                )
+            else:
+                self.feature_extractor = ConvFeatureExtractionChModel(
+                    in_channels=cfg.in_channels,
+                    conv_layers=feature_enc_layers,
+                    dropout=0.0,
+                    mode=cfg.extractor_mode,
+                    conv_bias=cfg.conv_bias,
+                    conv_groups=cfg.in_conv_groups,
+                )
         else:
             self.feature_extractor = Conv2DFeatureExtractionChModel(
                 in_channels=cfg.in_channels,
@@ -316,7 +358,7 @@ class Wav2Vec2ChSpecMlmModel(Wav2Vec2ChModel):
         )
         encoder_cls = TransformerEncoder
         if cfg.layer_type == "conformer" and cfg.pos_enc_type in ["rel_pos", "rope"]:
-            encoder_cls = ConformerEncoder
+            encoder_cls = ConformerEncoderV2
 
         # constrastive learning (cl) and mlm encoder
         self.encoder = encoder_cls(cfg)
@@ -691,6 +733,9 @@ class Wav2Vec2ChModelPtrained(Wav2Vec2ChModel):
 @dataclass
 class Wav2Vec2ChSpecPretConfig(Wav2Vec2ChPretConfig):
     spectrogram_1d: bool = II("task.spectrogram_1d")
+    conv_skip_connection: bool = field(
+        default=False, metadata={"help": "skip connection in CNN"}
+    )
     n_mels: int = II("task.n_mels")
 
 
@@ -883,14 +928,14 @@ class Wav2Vec2ChSpecMlmModelPtrained(Wav2Vec2ChSpecMlmModel):
                 cfg.pre_w2v_args = pre_w2v_args = convert_namespace_to_omegaconf(
                     pre_w2v_args)
 
-        model_normalized = pre_w2v_args.task.get(
-            "normalize", pre_w2v_args.model.get("normalize", False)
-        )
-        assert cfg.normalize == model_normalized, (
-            "Fine-tuning works best when data normalization is the same. "
-            "Please check that --normalize is set or unset for both"
-            "pre-training and here"
-        )
+        # model_normalized = pre_w2v_args.task.get(
+        #     "normalize", pre_w2v_args.model.get("normalize", False)
+        # )
+        # assert cfg.normalize == model_normalized, (
+        #     "Fine-tuning works best when data normalization is the same. "
+        #     "Please check that --normalize is set or unset for both"
+        #     "pre-training and here"
+        # )
 
         if hasattr(cfg, "checkpoint_activations") and cfg.checkpoint_activations:
             with open_dict(pre_w2v_args):
@@ -1039,6 +1084,47 @@ class ConvFeatureExtractionChModel(nn.Module):
         return x
 
 
+class ResnetFeatureExtractionChModel(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        conv_layers: List[Tuple[int, int, int]],
+        dropout: float = 0.0,
+        mode: str = "default",
+        conv_bias: bool = False,
+        conv_groups: int = 1,
+    ):
+        super().__init__()
+
+        assert mode in {"default", "layer_norm"}
+
+        in_d = in_channels
+        self.conv_layers = nn.ModuleList()
+        for i, cl in enumerate(conv_layers):
+            assert len(cl) == 3, "invalid conv definition: " + str(cl)
+            (dim, k, stride) = cl
+
+            cfg = {
+                "n_inputs": in_d,
+                "n_outputs": dim,
+                "kernel_size": k,
+                "stride": stride,
+                "dilation": 1,
+                "dropout": 0.0,
+                "mode": mode,
+                "activation_fn": "gelu",
+            }
+
+            self.conv_layers.append(TemporalResnetBlock(**cfg))
+            in_d = dim
+
+    def forward(self, x):
+        for conv in self.conv_layers:
+            x = conv(x)
+
+        return x
+
+
 class Conv2DFeatureExtractionChModel(nn.Module):
     def __init__(
         self,
@@ -1078,9 +1164,9 @@ class Conv2DFeatureExtractionChModel(nn.Module):
                     make_conv(),
                     nn.Dropout(p=dropout),
                     nn.Sequential(
-                        TransposeLast(),
+                        Transpose2DLast(),
                         Fp32LayerNorm(dim, elementwise_affine=True),
-                        TransposeLast(),
+                        Transpose2DLast(),
                     ),
                     nn.GELU(),
                 )
@@ -1120,10 +1206,426 @@ class Conv2DFeatureExtractionChModel(nn.Module):
         for conv in self.conv_layers:
             x = conv(x)
 
-        # (B, C, T, D) -> (B, C, D, T)
-        x = x.transpose(2, 3)
-
         # reshape (B, C, D, T) -> (B, C*D, T)
         x = x.reshape(x.shape[0], x.shape[1]*x.shape[2], x.shape[3])
 
         return x
+
+
+class Transpose2DLast(nn.Module):
+    def __init__(self, deconstruct_idx=None):
+        super().__init__()
+        self.deconstruct_idx = deconstruct_idx
+
+    def forward(self, x):
+        if self.deconstruct_idx is not None:
+            x = x[self.deconstruct_idx]
+        return x.transpose(-3, -1)
+
+
+class ConformerEncoderV2(ConformerEncoder):
+    def __init__(self, args):
+        nn.Module.__init__(self)
+        self.args = args
+        self.dropout = args.dropout
+        self.embedding_dim = args.encoder_embed_dim
+        self.pos_enc_type = args.pos_enc_type
+        max_source_positions = self.max_positions()
+
+        if self.pos_enc_type == "rel_pos":
+            self.embed_positions = RelPositionalEncoding(
+                max_source_positions, self.embedding_dim
+            )
+        elif self.pos_enc_type == "rope":
+            self.embed_positions = None
+        else:
+            raise Exception("Unsupported positional encoding type")
+
+        self.layers = nn.ModuleList(
+            [self.build_encoder_layer(args) for _ in range(args.encoder_layers)]
+        )
+        self.layer_norm_first = args.layer_norm_first
+        self.layer_norm = LayerNorm(self.embedding_dim)
+        self.layerdrop = args.encoder_layerdrop
+
+        self.apply(init_bert_params)
+
+    def extract_features(self, x, padding_mask=None, tgt_layer=None):
+        if padding_mask is not None:
+            x = index_put(x, padding_mask, 0)
+
+        # B x T x C -> T x B x C
+        x = x.transpose(0, 1)
+
+        # B X T X C here
+        position_emb = None
+        if self.pos_enc_type == "rel_pos":
+            position_emb = self.embed_positions(x)
+
+        if not self.layer_norm_first:
+            x = self.layer_norm(x)
+
+        x = F.dropout(x, p=self.dropout, training=self.training)
+
+        layer_results = []
+        r = None
+        for i, layer in enumerate(self.layers):
+            dropout_probability = np.random.random()
+            if not self.training or (dropout_probability > self.layerdrop):
+                x, (z, lr) = layer(
+                    x,
+                    self_attn_padding_mask=padding_mask,
+                    need_weights=False,
+                    position_emb=position_emb,
+                )
+                layer_results.append((x, z, lr))
+            if i == tgt_layer:
+                r = x
+                break
+
+        if r is not None:
+            x = r
+
+        # T x B x C -> B x T x C
+        x = x.transpose(0, 1)
+
+        return x, layer_results
+
+
+@dataclass
+class Wav2Vec2HeaderConfig(Wav2Vec2Config):
+    final_layer_norm: bool = field(
+        default=False, metadata={"help": "apply layernorm first in the transformer"}
+    )
+
+
+class TransformerEncoderHeader(TransformerEncoder):
+
+    def __init__(self, args: Wav2Vec2HeaderConfig):
+        nn.Module.__init__(self)
+
+        self.dropout = args.dropout
+        self.embedding_dim = args.encoder_embed_dim
+        self.required_seq_len_multiple = args.required_seq_len_multiple
+
+        self.layers = nn.ModuleList(
+            [self.build_encoder_layer(args) for _ in range(args.encoder_layers)]
+        )
+        self.layer_norm_first = args.layer_norm_first
+        self.layer_norm = LayerNorm(self.embedding_dim)
+        self.layerdrop = args.encoder_layerdrop
+
+        self.apply(init_bert_params)
+
+    def extract_features(
+        self,
+        x,
+        padding_mask=None,
+        tgt_layer=None,
+        min_layer=0,
+    ):
+        if padding_mask is not None:
+            x = index_put(x, padding_mask, 0)
+
+        if not self.layer_norm_first:
+            x = self.layer_norm(x)
+
+        # pad to the sequence length dimension
+        x, pad_length = pad_to_multiple(
+            x, self.required_seq_len_multiple, dim=-2, value=0
+        )
+        if pad_length > 0 and padding_mask is None:
+            padding_mask = x.new_zeros((x.size(0), x.size(1)), dtype=torch.bool)
+            padding_mask[:, -pad_length:] = True
+        else:
+            padding_mask, _ = pad_to_multiple(
+                padding_mask, self.required_seq_len_multiple, dim=-1, value=True
+            )
+        x = F.dropout(x, p=self.dropout, training=self.training)
+
+        # B x T x C -> T x B x C
+        x = x.transpose(0, 1)
+
+        layer_results = []
+        r = None
+        for i, layer in enumerate(self.layers):
+            dropout_probability = np.random.random() if self.layerdrop > 0 else 1
+            if not self.training or (dropout_probability > self.layerdrop):
+                x, (z, lr) = layer(
+                    x, self_attn_padding_mask=padding_mask, need_weights=False
+                )
+                if i >= min_layer:
+                    layer_results.append((x, z, lr))
+            if i == tgt_layer:
+                r = x
+                break
+
+        if r is not None:
+            x = r
+
+        # T x B x C -> B x T x C
+        x = x.transpose(0, 1)
+
+        # undo paddding
+        if pad_length > 0:
+            x = x[:, :-pad_length]
+
+            def undo_pad(a, b, c):
+                return (
+                    a[:-pad_length],
+                    b[:-pad_length] if b is not None else b,
+                    c[:-pad_length],
+                )
+
+            layer_results = [undo_pad(*u) for u in layer_results]
+
+        return x, layer_results
+
+
+class ConformerEncoderHeader(TransformerEncoderHeader):
+    def build_encoder_layer(self, args):
+        layer = ConformerWav2Vec2EncoderLayer(
+            embed_dim=self.embedding_dim,
+            ffn_embed_dim=args.encoder_ffn_embed_dim,
+            attention_heads=args.encoder_attention_heads,
+            dropout=args.dropout,
+            depthwise_conv_kernel_size=args.depthwise_conv_kernel_size,
+            activation_fn="swish",
+            attn_type=args.attn_type,
+            pos_enc_type=args.pos_enc_type,
+            use_fp16=args.fp16,  # only used for rope
+            final_layer_norm=args.final_layer_norm
+        )
+        layer = fsdp_wrap(layer)
+        if args.checkpoint_activations:
+            layer = checkpoint_wrapper(layer)
+        return layer
+
+    def __init__(self, args):
+        super().__init__(args)
+        self.args = args
+        self.dropout = args.dropout
+        self.embedding_dim = args.encoder_embed_dim
+        self.pos_enc_type = args.pos_enc_type
+        max_source_positions = self.max_positions()
+
+        if self.pos_enc_type == "rel_pos":
+            self.embed_positions = RelPositionalEncoding(
+                max_source_positions, self.embedding_dim
+            )
+        elif self.pos_enc_type == "rope":
+            self.embed_positions = None
+        else:
+            raise Exception("Unsupported positional encoding type")
+
+        self.layers = nn.ModuleList(
+            [self.build_encoder_layer(args) for _ in range(args.encoder_layers)]
+        )
+        self.layer_norm_first = args.layer_norm_first
+        self.layer_norm = LayerNorm(self.embedding_dim)
+        self.layerdrop = args.encoder_layerdrop
+
+        self.apply(init_bert_params)
+
+    def extract_features(self, x, padding_mask=None, tgt_layer=None):
+        if padding_mask is not None:
+            x = index_put(x, padding_mask, 0)
+
+        # B x T x C -> T x B x C
+        x = x.transpose(0, 1)
+
+        # B X T X C here
+        position_emb = None
+        if self.pos_enc_type == "rel_pos":
+            position_emb = self.embed_positions(x)
+
+        if not self.layer_norm_first:
+            x = self.layer_norm(x)
+
+        x = F.dropout(x, p=self.dropout, training=self.training)
+
+        layer_results = []
+        r = None
+        for i, layer in enumerate(self.layers):
+            dropout_probability = np.random.random()
+            if not self.training or (dropout_probability > self.layerdrop):
+                x, z = layer(
+                    x,
+                    self_attn_padding_mask=padding_mask,
+                    need_weights=False,
+                    position_emb=position_emb,
+                )
+                if tgt_layer is not None:
+                    layer_results.append((x, z))
+            if i == tgt_layer:
+                r = x
+                break
+
+        if r is not None:
+            x = r
+
+        # T x B x C -> B x T x C
+        x = x.transpose(0, 1)
+
+        return x, layer_results
+
+
+class ConformerEncoderLayer(torch.nn.Module):
+    """Conformer block based on https://arxiv.org/abs/2005.08100.
+    We currently don't support relative positional encoding in MHA"""
+
+    def __init__(
+        self,
+        embed_dim,
+        ffn_embed_dim,
+        attention_heads,
+        dropout,
+        use_fp16,
+        depthwise_conv_kernel_size=31,
+        activation_fn="swish",
+        attn_type=None,
+        pos_enc_type="abs",
+        final_layer_norm=True,
+    ):
+        """
+        Args:
+            embed_dim: Input embedding dimension
+            ffn_embed_dim: FFN layer dimension
+            attention_heads: Number of attention heads in MHA
+            dropout: dropout value
+            depthwise_conv_kernel_size: Size of kernel in depthwise conv layer in convolution module
+            activation_fn: Activation function name to use in convulation block and feed forward block
+            attn_type: MHA implementation from ESPNET vs fairseq
+            pos_enc_type: Positional encoding type - abs, rope, rel_pos
+        """
+        self.pos_enc_type = pos_enc_type
+        super(ConformerEncoderLayer, self).__init__()
+
+        self.ffn1 = FeedForwardModule(
+            embed_dim,
+            ffn_embed_dim,
+            dropout,
+            dropout,
+        )
+
+        self.self_attn_layer_norm = LayerNorm(embed_dim, export=False)
+        self.self_attn_dropout = torch.nn.Dropout(dropout)
+        if attn_type == "espnet":
+            if self.pos_enc_type == "rel_pos":
+                self.self_attn = RelPositionMultiHeadedAttention(
+                    embed_dim,
+                    attention_heads,
+                    dropout=dropout,
+                )
+            elif self.pos_enc_type == "rope":
+                self.self_attn = RotaryPositionMultiHeadedAttention(
+                    embed_dim, attention_heads, dropout=dropout, precision=use_fp16
+                )
+            elif self.pos_enc_type == "abs":
+                self.self_attn = ESPNETMultiHeadedAttention(
+                    embed_dim,
+                    attention_heads,
+                    dropout=dropout,
+                )
+            else:
+                raise Exception(f"Unsupported attention type {self.pos_enc_type}")
+        else:
+            # Default to fairseq MHA
+            self.self_attn = MultiheadAttention(
+                embed_dim,
+                attention_heads,
+                dropout=dropout,
+            )
+
+        self.conv_module = ConvolutionModule(
+            embed_dim=embed_dim,
+            channels=embed_dim,
+            depthwise_kernel_size=depthwise_conv_kernel_size,
+            dropout=dropout,
+            activation_fn=activation_fn,
+        )
+
+        self.ffn2 = FeedForwardModule(
+            embed_dim,
+            ffn_embed_dim,
+            dropout,
+            dropout,
+            activation_fn=activation_fn,
+        )
+        if final_layer_norm:
+            self.final_layer_norm = LayerNorm(embed_dim, export=False)
+        else:
+            self.final_layer_norm = None
+
+    def forward(
+        self,
+        x,
+        encoder_padding_mask: Optional[torch.Tensor],
+        position_emb: Optional[torch.Tensor] = None,
+    ):
+        """
+        Args:
+            x: Tensor of shape T X B X C
+            encoder_padding_mask: Optional mask tensor
+            positions:
+        Returns:
+            Tensor of shape T X B X C
+        """
+        residual = x
+        x = self.ffn1(x)
+        x = x * 0.5 + residual
+        residual = x
+        x = self.self_attn_layer_norm(x)
+        if self.pos_enc_type == "rel_pos":
+            x, attn = self.self_attn(
+                query=x,
+                key=x,
+                value=x,
+                key_padding_mask=encoder_padding_mask,
+                pos_emb=position_emb,
+                need_weights=False,
+            )
+        else:
+            x, attn = self.self_attn(
+                query=x,
+                key=x,
+                value=x,
+                key_padding_mask=encoder_padding_mask,
+                need_weights=False,
+            )
+        x = self.self_attn_dropout(x)
+        x = x + residual
+
+        residual = x
+        # TBC to BTC
+        x = x.transpose(0, 1)
+        x = self.conv_module(x)
+        # BTC to TBC
+        x = x.transpose(0, 1)
+        x = residual + x
+
+        residual = x
+        x = self.ffn2(x)
+
+        layer_result = x
+
+        x = x * 0.5 + residual
+
+        if self.final_layer_norm:
+            x = self.final_layer_norm(x)
+        return x, (attn, layer_result)
+
+
+class ConformerWav2Vec2EncoderLayer(ConformerEncoderLayer):
+    """Encoder layer for Wav2vec2 encoder"""
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        self_attn_mask: torch.Tensor = None,
+        self_attn_padding_mask: torch.Tensor = None,
+        need_weights: bool = False,
+        att_args=None,
+        position_emb=None,
+    ):
+        return super().forward(x, self_attn_padding_mask, position_emb)
