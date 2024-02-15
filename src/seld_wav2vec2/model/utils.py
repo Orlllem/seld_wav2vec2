@@ -17,3 +17,9 @@ def get_activation_fn(activation: str):
     else:
         raise RuntimeError(
             "--activation-fn {} not supported".format(activation))
+
+
+def SiLU_inplace_to_False(module):
+    for _, layer in module.named_modules():
+        if isinstance(layer, nn.SiLU):
+            layer.inplace = False
