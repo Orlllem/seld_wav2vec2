@@ -1,6 +1,9 @@
+import collections
+import json
 import math
+import os
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import numpy as np
 import torch
@@ -21,15 +24,142 @@ from seld_wav2vec2.criterions.evaluation_metrics import (
     early_stopping_metric,
 )
 
-eps = np.finfo(np.float32).eps
+eps = torch.finfo(torch.float32).eps
 
 # label frame resolution (label_frame_res)
 nb_label_frames_1s_100ms = 10  # 1/label_hop_len_s = 1/0.1
 
 
+def sigmoid(x):
+    return 1 / (1 + math.exp(-x))
+
+
+class SigmoidSchedule:
+    def __init__(self, N, x_min=-3, x_max=3, a_min=1.0, a_max=2.0):
+        self.a_min = a_min
+        self.a_max = a_max
+        self.steps = np.log(np.logspace(x_min, x_max, num=N))
+
+    def __call__(self, step):
+        x = self.steps[step]
+        return self.a_min + sigmoid(x) * (self.a_max - self.a_min)
+
+
+class AdaFocal(nn.Module):
+    def __init__(
+        self,
+        num_bins=15,
+        adafocal_lambda=1.0,
+        adafocal_gamma_initial=1.0,
+        adafocal_gamma_max=20.0,
+        adafocal_gamma_min=-2.0,
+        adafocal_switch_pt=0.2,
+        update_gamma_every=-1,
+        reduction="sum",
+    ):
+        super().__init__()
+
+        self.num_bins = num_bins
+        self.lamda = adafocal_lambda
+        self.gamma_initial = adafocal_gamma_initial
+        self.switch_pt = adafocal_switch_pt
+        self.gamma_max = adafocal_gamma_max
+        self.gamma_min = adafocal_gamma_min
+        self.update_gamma_every = update_gamma_every
+        self.reduction = reduction
+
+        # This initializes the bin_stats variable
+        self.bin_stats = collections.defaultdict(dict)
+        for bin_no in range(self.num_bins):
+            self.bin_stats[bin_no]["lower_boundary"] = bin_no * (1 / self.num_bins)
+            self.bin_stats[bin_no]["upper_boundary"] = (bin_no + 1) * (
+                1 / self.num_bins
+            )
+            self.bin_stats[bin_no]["gamma"] = self.gamma_initial
+
+    # This function updates the bin statistics which are used by the Adafocal loss at every epoch.
+    def update_bin_stats(self, val_adabin_dict):
+        for bin_no in range(self.num_bins):
+            # This is the Adafocal gamma update rule
+            prev_gamma = self.bin_stats[bin_no]["gamma"]
+            exp_term = val_adabin_dict[bin_no]["calibration_gap"]
+            if prev_gamma > 0:
+                next_gamma = prev_gamma * math.exp(self.lamda * exp_term)
+            else:
+                next_gamma = prev_gamma * math.exp(-self.lamda * exp_term)
+            # This switches between focal and inverse-focal loss when required.
+            if abs(next_gamma) < self.switch_pt:
+                if next_gamma > 0:
+                    next_gamma = -self.switch_pt
+                else:
+                    next_gamma = self.switch_pt
+            self.bin_stats[bin_no]["gamma"] = max(
+                min(next_gamma, self.gamma_max), self.gamma_min
+            )  # gamma-clipping
+            self.bin_stats[bin_no]["lower_boundary"] = val_adabin_dict[bin_no][
+                "lower_bound"
+            ]
+            self.bin_stats[bin_no]["upper_boundary"] = val_adabin_dict[bin_no][
+                "upper_bound"
+            ]
+        # This saves the "bin_stats" to a text file.
+        save_file = os.path.join(self.args.save_path, "val_bin_stats.txt")
+        with open(save_file, "a") as write_file:
+            json.dump(self.bin_stats, write_file)
+            write_file.write("\n")
+        return
+
+    # This function selects the gammas for each sample based on which bin it falls into.
+    def get_gamma_per_sample(self, pt):
+        gamma_list = []
+        batch_size = pt.shape[0]
+        for i in range(batch_size):
+            pt_sample = pt[i].item()
+            for bin_no, stats in self.bin_stats.items():
+                if bin_no == 0 and pt_sample < stats["upper_boundary"]:
+                    break
+                elif (
+                    bin_no == self.num_bins - 1 and pt_sample >= stats["lower_boundary"]
+                ):
+                    break
+                elif (
+                    pt_sample >= stats["lower_boundary"]
+                    and pt_sample < stats["upper_boundary"]
+                ):
+                    break
+            gamma_list.append(stats["gamma"])
+        return torch.tensor(gamma_list)
+
+    # This computes the loss value to be returned for back-propagation.
+    def forward(self, inputs, targets):
+
+        ce_loss = F.binary_cross_entropy_with_logits(
+            inputs, targets.float(), reduction="none"
+        ).reshape(-1)
+
+        p = torch.sigmoid(inputs)
+
+        pt = p * targets + (1 - p) * (1 - targets)
+        pt = pt.reshape(-1)
+
+        gamma = self.get_gamma_per_sample(pt).to(pt.device)
+        gamma_sign = torch.sign(gamma)
+        gamma_mag = torch.abs(gamma)
+        pt = gamma_sign * pt
+
+        loss = ce_loss * ((1 - pt + eps) ** gamma_mag)
+
+        if self.reduction == "mean":
+            loss = loss.mean()
+        elif self.reduction == "sum":
+            loss = loss.sum()
+
+        return loss
+
+
 def schedule_weight(current_step, boundaries, values):
-    boundaries.append(float("inf"))
-    values.append(0)
+    # boundaries.append(float("inf"))
+    # values.append(0)
 
     # check boundaries
     # first index in 'boundaries' greater than current_step
@@ -112,6 +242,10 @@ class MultitaskSedDoaCriterionConfig(FairseqDataclass):
         default=False,
         metadata={"help": "whether to use focal loss"},
     )
+    focal_ada: Optional[bool] = field(
+        default=False,
+        metadata={"help": "whether to use ada-focal"},
+    )
     focal_alpha: Optional[float] = field(
         default=0.25,
         metadata={"help": "focal loss alpha"},
@@ -160,9 +294,21 @@ class MultitaskSedDoaDwaCriterionConfig(MultitaskSedDoaCriterionConfig):
 
 @dataclass
 class MultitaskSedDoaGradNormCriterionConfig(MultitaskSedDoaCriterionConfig):
-    grad_norm_alpha: Optional[float] = field(
-        default=0.12,
+    grad_norm_alpha: Any = field(
+        default=1.0,
         metadata={"help": "gradnorm alpha parameter"},
+    )
+    skip_grad_norm_for_n_updates: Optional[int] = field(
+        default=0,
+        metadata={"help": "skip grad-norm for N fine-tuned updates"},
+    )
+    num_updates: Optional[int] = field(
+        default=320000,
+        metadata={"help": "num updates of training"},
+    )
+    grad_norm_x_range: Tuple[int, int] = field(
+        default=(-3, 3),
+        metadata={"help": "gradnorm x parameter"},
     )
 
 
@@ -536,6 +682,7 @@ class MultitaskSeldAudioFrameCriterion(FairseqCriterion):
         extend_mask=True,
         constrain_r_unit=False,
         focal_loss=False,
+        focal_ada=False,
         focal_alpha=0.25,
         focal_gamma=2.0,
         focal_bw=False,
@@ -558,6 +705,7 @@ class MultitaskSeldAudioFrameCriterion(FairseqCriterion):
         self.constrain_r_unit = constrain_r_unit
 
         self.focal_loss = focal_loss
+        self.focal_ada = focal_ada
         self.focal_alpha = focal_alpha
         self.focal_gamma = focal_gamma
         self.focal_bw = focal_bw
@@ -575,6 +723,9 @@ class MultitaskSeldAudioFrameCriterion(FairseqCriterion):
             self.regr_r_unit_loss = nn.L1Loss(reduction="sum")
         else:
             self.regr_r_unit_loss = nn.MSELoss(reduction="sum")
+
+        if self.focal_ada:
+            self.ada_focal = AdaFocal(reduction="sum")
 
     def forward(self, model, sample, reduce=True):
         """Compute the loss for the given sample.
@@ -667,13 +818,19 @@ class MultitaskSeldAudioFrameCriterion(FairseqCriterion):
                         focal_alpha = 1.0
                 else:
                     focal_alpha = self.focal_alpha
-                multi_label_loss = sigmoid_focal_loss(
-                    class_logits,
-                    class_labels,
-                    alpha=focal_alpha,
-                    gamma=self.focal_gamma,
-                    reduction="sum",
-                )
+                if self.focal_ada:
+                    multi_label_loss = self.ada_focal(
+                        class_logits,
+                        class_labels,
+                    )
+                else:
+                    multi_label_loss = sigmoid_focal_loss(
+                        class_logits,
+                        class_labels,
+                        alpha=focal_alpha,
+                        gamma=self.focal_gamma,
+                        reduction="sum",
+                    )
             else:
                 multi_label_loss = F.binary_cross_entropy_with_logits(
                     class_logits, class_labels, weight=weights, reduction="sum"
@@ -741,13 +898,19 @@ class MultitaskSeldAudioFrameCriterion(FairseqCriterion):
             class_labels[class_pad_mask] = torch.tensor(0.0).to(class_labels)
 
             if self.focal_loss:
-                multi_label_loss = sigmoid_focal_loss(
-                    class_logits,
-                    class_labels,
-                    alpha=self.focal_alpha,
-                    gamma=self.focal_gamma,
-                    reduction="sum",
-                )
+                if self.focal_ada:
+                    multi_label_loss = self.ada_focal(
+                        class_logits,
+                        class_labels,
+                    )
+                else:
+                    multi_label_loss = sigmoid_focal_loss(
+                        class_logits,
+                        class_labels,
+                        alpha=self.focal_alpha,
+                        gamma=self.focal_gamma,
+                        reduction="sum",
+                    )
             else:
                 multi_label_loss = F.binary_cross_entropy_with_logits(
                     class_logits, class_labels, reduction="sum"
@@ -1215,6 +1378,9 @@ class MultitaskSeldAudioFrameCartDcaseGradNormCriterion(
         focal_bw=False,
         regr_type="mse",
         grad_norm_alpha=0.12,
+        grad_norm_x_range=[-3, 3],
+        num_updates=320000,
+        skip_grad_norm_for_n_updates=0,
     ):
         super().__init__(
             task,
@@ -1235,8 +1401,19 @@ class MultitaskSeldAudioFrameCartDcaseGradNormCriterion(
 
         self.alpha = grad_norm_alpha
         self.initial_task_loss = None
+        self.skip_grad_norm_for_n_updates = skip_grad_norm_for_n_updates
 
-    def compute_grad_norm(self, task_loss, model):
+        if not isinstance(self.alpha, float):
+            assert len(self.alpha) == 2
+            self.sigmoid_schedule = SigmoidSchedule(
+                N=num_updates,
+                x_min=grad_norm_x_range[0],
+                x_max=grad_norm_x_range[1],
+                a_min=self.alpha[0],
+                a_max=self.alpha[1],
+            )
+
+    def compute_grad_norm(self, task_loss, model, alpha):
         # compute the weighted loss w_i(t) * L_i(t)
         weighted_task_loss = torch.mul(model.w2v_encoder.weights, task_loss)
 
@@ -1246,6 +1423,9 @@ class MultitaskSeldAudioFrameCartDcaseGradNormCriterion(
 
         # get the total loss
         loss = torch.sum(weighted_task_loss)
+
+        if self.skip_grad_norm:
+            return loss
 
         # This is equivalent to compute each \nabla_W L_i(t)
         loss.backward(retain_graph=True)
@@ -1285,7 +1465,7 @@ class MultitaskSeldAudioFrameCartDcaseGradNormCriterion(
         # compute the GradNorm loss
         # this term has to remain constant
         constant_term = torch.tensor(
-            mean_norm * (inverse_train_rate**self.alpha), requires_grad=False
+            mean_norm * (inverse_train_rate**alpha), requires_grad=False
         )
         constant_term = constant_term.cuda()
         # this is the GradNorm loss itself
@@ -1313,7 +1493,29 @@ class MultitaskSeldAudioFrameCartDcaseGradNormCriterion(
         # normalize_coeff = 2.0 / torch.sum(model.w2v_encoder.weights.data, dim=0)
         # model.w2v_encoder.weights.data = model.w2v_encoder.weights.data * normalize_coeff
 
-        model.w2v_encoder.weights.data = 2 * F.softmax(model.w2v_encoder.weights.data, dim=-1)
+        current_step = model.w2v_encoder.num_updates
+
+        if (
+            current_step <= model.w2v_encoder.freeze_finetune_updates
+            or current_step <= self.skip_grad_norm_for_n_updates
+        ):
+            self.skip_grad_norm = True
+        else:
+            self.skip_grad_norm = False
+
+        if self.skip_grad_norm:
+            model.w2v_encoder.weights.data = torch.tensor(self.loss_weights).to(
+                model.w2v_encoder.weights.device
+            )
+        else:
+            model.w2v_encoder.weights.data = 2 * F.softmax(model.w2v_encoder.weights.data, dim=-1)
+
+        if isinstance(self.alpha, float):
+            alpha = self.alpha
+        else:
+            alpha = self.sigmoid_schedule(current_step)
+
+            metrics.log_scalar("alpha", alpha, weight=0, round=3, priority=10000)
 
         weights = model.w2v_encoder.weights.data.cpu()
 
@@ -1330,7 +1532,7 @@ class MultitaskSeldAudioFrameCartDcaseGradNormCriterion(
             )
             task_loss = torch.stack([multi_label_loss, reg_loss])
             if self.training:
-                grad_norm_loss = self.compute_grad_norm(task_loss, model)
+                grad_norm_loss = self.compute_grad_norm(task_loss, model, alpha=alpha)
             else:
                 grad_norm_loss = torch.tensor(0).to(loss.device)
 
