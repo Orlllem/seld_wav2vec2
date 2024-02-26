@@ -9,7 +9,7 @@ pkg_dir = os.path.dirname(__name__)
 requirements = [
     "autopep8",
     "pandas==1.5.3",
-    "soundfile==0.11.0",
+    "soundfile==0.12.1",
     "librosa==0.9.2",
     "scikit-learn==0.24.2",
     "matplotlib==3.5.3",
