@@ -14,6 +14,7 @@ from torch_audiomentations.core.transforms_interface import (
 )
 from torch_audiomentations.utils.multichannel import is_multichannel
 from torch_audiomentations.utils.object_dict import ObjectDict
+from torchaudio import functional as F
 
 
 def sph2cart(azimuth, elevation, r):
@@ -58,6 +59,20 @@ def select_shift_tf(p: float = 0.5, rollover: bool = False, in_channels: int = 4
     return shift_tf
 
 
+def convert_spec2d_to_spec1d(spec):
+    # spec (7, 64, T)
+    C, N, T = spec.shape
+    spec1d = spec.reshape(C*N, T)
+    return spec1d  # spec (448, T)
+
+
+def convert_spec1d_to_spec2d(spec):
+    # spec (448, T)
+    T = spec.shape[-1]
+    spec2d = spec.reshape(7, 64, T)
+    return spec2d  # (7, 64, T)
+
+
 class RandomSwapChannel(object):
     """
     The data augmentation random swap xyz channel of tfmap of FOA format.
@@ -74,10 +89,13 @@ class RandomSwapChannel(object):
         x_new = x.clone()
         y_sed_new = y_sed.clone()
         y_doa_new = y_doa.clone()
-        for i in range(x.size(0)):
-            if random.random() < self.p:
-                x_new[i], y_sed_new[i], y_doa_new[i] = self.apply(
-                    x=x[i], y_sed=y_sed[i], y_doa=y_doa[i])
+
+        idx = np.where(np.random.rand(x.size(0)) < self.p)[0]
+
+        for i in idx:
+            x_new[i], y_sed_new[i], y_doa_new[i] = self.apply(
+                x=x[i], y_sed=y_sed[i], y_doa=y_doa[i]
+            )
 
         return x_new, y_sed_new, y_doa_new
 
@@ -127,15 +145,20 @@ class RandomSwapChannel(object):
 
     def apply(self, x: torch.Tensor, y_sed: torch.Tensor, y_doa: torch.Tensor):
         """
-        :param x < np.ndarray (n_channels, n_time_steps)>
-        Class-wise:
-            y_sed: <np.ndarray (n_time_steps, n_classes)> reg_xyz, accdoa
-            y_doa: <np.ndarray (n_time_steps, 3*n_classes)> reg_xyz, accdoa
+
+        - channels == 4
+        WYZX
+        - channels == 7
+        WYZXXYZ
+
+        x: torch.Tensor (C, T)
+        y_sed: torch.Tensor (T, N)
+        y_doa: torch.Tensor (T, 3*N)
+
         This data augmentation change x_sed and y_doa
         """
         n_input_channels = x.shape[0]
-        assert n_input_channels == 4 or n_input_channels == 7, 'invalid input channel: {}'.format(
-            n_input_channels)
+
         x_new = x.clone()
         y_doa_new = y_doa.clone()
 
@@ -159,21 +182,44 @@ class RandomSwapChannel(object):
                 x_new[2], x_new[3] = -x[2], -x[3]
             else:
                 print("only seven types of transform are available")
-        else:
+
+        elif n_input_channels == 7:
+
+            # input -> W Y Z X X Y Z: 7 channels
             # random method
             m = np.random.randint(2, size=(4,))
             # change input feature
             if m[0] == 1:  # random swap x, y
                 x_new[1] = x[3]
                 x_new[3] = x[1]
-                x_new[-3] = x[-1]
-                x_new[-1] = x[-3]
+                x_new[-3] = x[-2]
+                x_new[-2] = x[-3]
             if m[1] == 1:  # negate x
-                x_new[-1] = -x_new[-1]
-            if m[2] == 1:  # negate y
                 x_new[-3] = -x_new[-3]
-            if m[3] == 1:  # negate z
+            if m[2] == 1:  # negate y
                 x_new[-2] = -x_new[-2]
+            if m[3] == 1:  # negate z
+                x_new[-1] = -x_new[-1]
+
+        else:
+
+            n_mels = int(n_input_channels/7)
+
+            # random method
+            m = np.random.randint(2, size=(4,))
+
+            # change input feature
+            if m[0] == 1:  # random swap x, y
+                x_new[1 * n_mels: 2 * n_mels] = x[3 * n_mels: 4 * n_mels]
+                x_new[3 * n_mels: 4 * n_mels] = x[1 * n_mels: 2 * n_mels]
+                x_new[4 * n_mels: 5 * n_mels] = x[5 * n_mels: 6 * n_mels]
+                x_new[5 * n_mels: 6 * n_mels] = x[4 * n_mels: 5 * n_mels]
+            if m[1] == 1:  # negate x
+                x_new[4 * n_mels: 5 * n_mels] = -x_new[4 * n_mels: 5 * n_mels]
+            if m[2] == 1:  # negate y
+                x_new[5 * n_mels: 6 * n_mels] = -x_new[5 * n_mels: 6 * n_mels]
+            if m[3] == 1:  # negate z
+                x_new[6 * n_mels: 7 * n_mels] = -x_new[6 * n_mels: 7 * n_mels]
 
         # change y_doa
         if y_doa.shape[1] == 3 * self.n_classes:  # classwise reg_xyz, accdoa
@@ -237,18 +283,23 @@ class SpecShift(object):
         x_new = x.clone()
         y_sed_new = y_sed.clone()
         y_doa_new = y_doa.clone()
-        for i in range(x.size(0)):
-            if random.random() < self.p:
-                x_new[i], y_sed_new[i], y_doa_new[i] = self.apply(
-                    x[i], y_sed[i], y_doa[i],
-                    num_samples_to_shift=random.randint(self.min_shift, self.max_shift))
+
+        idx = np.where(np.random.rand(x.size(0)) < self.p)[0]
+
+        for i in idx:
+            x_new[i], y_sed_new[i], y_doa_new[i] = self.apply(
+                spec=x[i],
+                sed_label=y_sed[i],
+                doa_label=y_doa[i],
+                num_samples_to_shift=random.randint(self.min_shift, self.max_shift),
+            )
 
         return x_new, y_sed_new, y_doa_new
 
     def apply(self, spec, sed_label, doa_label, num_samples_to_shift):
 
         spec = torch.roll(
-            spec, shifts=num_samples_to_shift, dims=1
+            spec, shifts=num_samples_to_shift, dims=-1
         )
         sed_label = torch.roll(
             sed_label, shifts=num_samples_to_shift, dims=0
@@ -501,3 +552,85 @@ class SeqShift(Shift):
             doa_targets=shifted_doa_targets,
             target_rate=target_rate,
         )
+
+
+class SpecAugment(torch.nn.Module):
+    r"""Apply time and frequency masking to a spectrogram.
+    Args:
+        n_time_masks (int): Number of time masks. If its value is zero, no time masking will be applied.
+        time_mask_param (int): Maximum possible length of the time mask.
+        n_freq_masks (int): Number of frequency masks. If its value is zero, no frequency masking will be applied.
+        freq_mask_param (int): Maximum possible length of the frequency mask.
+        iid_masks (bool, optional): Applies iid masks to each of the examples in the batch dimension.
+            This option is applicable only when the input tensor is 4D. (Default: ``True``)
+        p (float, optional): maximum proportion of time steps that can be masked.
+            Must be within range [0.0, 1.0]. (Default: 1.0)
+        zero_masking (bool, optional): If ``True``, use 0 as the mask value,
+            else use mean of the input tensor. (Default: ``False``)
+    """
+
+    __constants__ = [
+        "n_time_masks",
+        "time_mask_param",
+        "n_freq_masks",
+        "freq_mask_param",
+        "iid_masks",
+        "p",
+        "zero_masking",
+    ]
+
+    def __init__(
+        self,
+        n_time_masks: int,
+        time_mask_param: int,
+        n_freq_masks: int,
+        freq_mask_param: int,
+        iid_masks: bool = True,
+        p: float = 1.0,
+        zero_masking: bool = False,
+    ) -> None:
+        super(SpecAugment, self).__init__()
+        self.n_time_masks = n_time_masks
+        self.time_mask_param = time_mask_param
+        self.n_freq_masks = n_freq_masks
+        self.freq_mask_param = freq_mask_param
+        self.iid_masks = iid_masks
+        self.p = p
+        self.zero_masking = zero_masking
+
+    def forward(self, specgram: Tensor) -> Tensor:
+        r"""
+        Args:
+            specgram (Tensor): Tensor of shape `(..., freq, time)`.
+        Returns:
+            Tensor: Masked spectrogram of shape `(..., freq, time)`.
+        """
+        if self.zero_masking:
+            mask_value = 0.0
+        else:
+            mask_value = specgram.mean()
+        time_dim = specgram.dim() - 1
+        freq_dim = time_dim - 1
+
+        if specgram.dim() > 2 and self.iid_masks is True:
+            specgram = specgram.unsqueeze(0)
+            for _ in range(self.n_time_masks):
+                specgram = F.mask_along_axis_iid(
+                    specgram, self.time_mask_param, mask_value, time_dim + 1, p=self.p
+                )
+            for _ in range(self.n_freq_masks):
+                specgram = F.mask_along_axis_iid(
+                    specgram, self.freq_mask_param, mask_value, freq_dim + 1, p=self.p
+                )
+            specgram = specgram.squeeze(0)
+        else:
+            for _ in range(self.n_time_masks):
+                specgram = F.mask_along_axis(
+                    specgram, self.time_mask_param, mask_value, time_dim, p=self.p
+                )
+            for _ in range(self.n_freq_masks):
+                specgram = F.mask_along_axis(
+                    specgram, self.freq_mask_param, mask_value, freq_dim, p=self.p
+                )
+
+        return specgram
