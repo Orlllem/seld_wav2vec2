@@ -133,7 +133,9 @@ class AddTargetSeldAudioFrameClassDataset(AddTargetEventDataset):
         shift_prob=0.5,
         shift_rollover=False,
         n_classes=11,
-        in_channels=4
+        in_channels=4,
+        spectrogram_1d=False,
+
     ):
         super().__init__(dataset, labels)
 
@@ -141,13 +143,15 @@ class AddTargetSeldAudioFrameClassDataset(AddTargetEventDataset):
 
         if doa_swap_augment and shift_augment:
             self.swap_transform = RandomSwapChannel(
-                p=doa_swap_prob, n_classes=n_classes)
+                p=doa_swap_prob, n_classes=n_classes
+            )
             self.shift_transform = select_shift_tf(
                 p=shift_prob, rollover=shift_rollover,
                 in_channels=in_channels)
         elif doa_swap_augment and shift_augment is False:
             self.swap_transform = RandomSwapChannel(
-                p=doa_swap_prob, n_classes=n_classes)
+                p=doa_swap_prob, n_classes=n_classes
+            )
             self.shift_transform = None
         elif shift_augment and doa_swap_augment is False:
             self.swap_transform = None
