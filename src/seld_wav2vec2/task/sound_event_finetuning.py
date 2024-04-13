@@ -128,7 +128,7 @@ class States(UserDict):
 class SoundEventPretrainingConfig(AudioPretrainingConfig):
     norm_per_channel: bool = field(
         default=False,
-        metadata={"help": ("Normalize per channel when have multiple channels")},
+        metadata={"help": "Normalize per channel when have multiple channels"},
     )
     spectrogram_input: bool = field(
         default=False,
@@ -137,10 +137,14 @@ class SoundEventPretrainingConfig(AudioPretrainingConfig):
         },
     )
     raw_audio_input: bool = field(
-        default=False, metadata={"help": ("Whether to use raw audio")}
+        default=False, metadata={"help": "Whether to use raw audio"}
     )
     spec_normalize: bool = field(
-        default=False, metadata={"help": ("Normalize the resulting " "spectrogram")}
+        default=True, metadata={"help": "Normalize the resulting spectrogram"}
+    )
+    norm_spec_foaiv: bool = field(
+        default=True,
+        metadata={"help": "Normalize the foa_iv"},
     )
     audio_augm: bool = field(
         default=False, metadata={"help": "Apply data augmentation on the 3D audio"}
@@ -257,6 +261,7 @@ class SoundEventPretrainingTask(AudioPretrainingTask):
                 pad_max=False,
                 normalize=task_cfg.normalize,
                 spec_normalize=self.cfg.spec_normalize,
+                norm_spec_foaiv=self.cfg.norm_spec_foaiv,
                 spectrogram_1d=self.cfg.spectrogram_1d,
                 norm_per_channel=self.cfg.norm_per_channel,
                 num_buckets=self.cfg.num_batch_buckets or int(self.cfg.tpu),
@@ -354,8 +359,22 @@ class SoundEventFinetuningConfig(SoundEventPretrainingConfig):
         default=(0.1, 1.0, 0.025),
         metadata={"help": ("threshold range: min, max, step")},
     )
+    center_scale_spec4ch: Tuple[float, float] = field(
+        default=(0.0, 1.0),
+        metadata={"help": ("standardization center-scale spec-4ch")},
+    )
+    center_scale_foaiv: Tuple[float, float] = field(
+        default=(0.0, 1.0),
+        metadata={"help": ("standardization center-scale foa-iv")},
+    )
+    norm_center_scale: bool = field(
+        default=False, metadata={"help": "normalizar center-scale spectrogram"}
+    )
     spec_augment: bool = field(
-        default=False, metadata={"help": "spec-augment of shift"}
+        default=False, metadata={"help": "augment of log-mel spectrogram"}
+    )
+    augment_foaiv: bool = field(
+        default=True, metadata={"help": "spec-augment of foa-iv"}
     )
     time_mask_F: int = field(
         default=21,
@@ -364,6 +383,26 @@ class SoundEventFinetuningConfig(SoundEventPretrainingConfig):
     time_mask_T: int = field(
         default=20,
         metadata={"help": "t mask parameter in spec data augment"},
+    )
+    n_time_masks: int = field(
+        default=1,
+        metadata={"help": "number of t mask parameter in spec data augment"},
+    )
+    n_freq_masks: int = field(
+        default=1,
+        metadata={"help": "number of freq mask parameter in spec data augment"},
+    )
+    iid_masks: bool = field(
+        default=False,
+        metadata={"help": "iid mask parameter in spec data augment"},
+    )
+    mask_prob: float = field(
+        default=1.0,
+        metadata={"help": "prob mask parameter in spec data augment"},
+    )
+    zero_masking: bool = field(
+        default=True,
+        metadata={"help": "zero-mask mask parameter in spec data augment"},
     )
 
 
@@ -495,14 +534,24 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
                 pad_max=False,
                 normalize=task_cfg.normalize,
                 spec_normalize=self.cfg.spec_normalize,
+                norm_spec_foaiv=self.cfg.norm_spec_foaiv,
+                norm_center_scale=self.cfg.norm_center_scale,
+                center_scale_spec4ch=self.cfg.center_scale_spec4ch,
+                center_scale_foaiv=self.cfg.center_scale_foaiv,
                 spectrogram_1d=self.cfg.spectrogram_1d,
                 norm_per_channel=self.cfg.norm_per_channel,
                 num_buckets=self.cfg.num_batch_buckets or int(self.cfg.tpu),
                 audio_transforms=audio_transforms,
                 random_crop=self.cfg.random_crop,
                 spec_augment=spec_augment,
+                augment_foaiv=self.cfg.augment_foaiv,
                 time_mask_F=self.cfg.time_mask_F,
                 time_mask_T=self.cfg.time_mask_T,
+                n_freq_masks=self.cfg.n_freq_masks,
+                n_time_masks=self.cfg.n_time_masks,
+                iid_masks=self.cfg.iid_masks,
+                mask_prob=self.cfg.mask_prob,
+                zero_masking=self.cfg.zero_masking,
                 n_mels=self.cfg.n_mels,
                 hop_len_s=self.cfg.hop_len_s,
             )
@@ -545,7 +594,8 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
                 shift_prob=self.cfg.shift_prob,
                 shift_rollover=self.cfg.shift_rollover,
                 n_classes=self.cfg.nb_classes,
-                in_channels=self.cfg.in_channels
+                in_channels=self.cfg.in_channels,
+                spectrogram_1d=self.cfg.spectrogram_1d,
             )
         else:
             self.datasets[split] = AddTargetSeldSeqClassDataset(
