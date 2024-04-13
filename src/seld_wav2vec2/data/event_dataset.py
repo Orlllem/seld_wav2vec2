@@ -1,27 +1,123 @@
-
-
+import glob
 import logging
+import os
+import random
 
 import numpy as np
 import pyarrow
+import scipy
 import soundfile as sf
 import torch
 import torch.nn.functional as F
 from fairseq.data.audio.raw_audio_dataset import FileAudioDataset, RawAudioDataset
 from fairseq.data.text_compressor import TextCompressionLevel
+from scipy.interpolate import make_interp_spline
+from seld_ambisonics.common import AmbiFormat, AmbisonicArray
+from seld_ambisonics.encoder import AmbiEncoder
+from seld_ambisonics.position import MovingSource, Position, PositionalSource
 from spafe.fbanks import gammatone_fbanks
 from torchaudio.transforms import (
     AmplitudeToDB,
-    FrequencyMasking,
     MelScale,
     Spectrogram,
-    TimeMasking,
-    TimeStretch,
 )
+
+from seld_wav2vec2.data.transforms import SpecAugment
 
 logger = logging.getLogger(__name__)
 
 eps = torch.finfo(torch.float32).eps
+
+
+ROOT_DIR = os.path.dirname(os.path.realpath(__file__)).rsplit(os.sep, 3)[0]
+
+IR_LIST = glob.glob(
+    f"{ROOT_DIR}/data/pre-training/IRs/B_format_resampled/*.wav", recursive=True
+)
+
+# Phi can vary all around the horizontal plane, so 0 360
+# Elevation is common to vary between -60 60, but we can choose different values as well,such as -90 90
+# Radius varies from 0 to 10m since is the common approach in sounds localization in close environments
+PHI, ELE, Z = np.arange(0, 360, 5), np.arange(-60, 60, 5), np.arange(0, 10, 0.2)
+
+N_POSITIONS = [3, 4, 5, 6, 7]
+
+
+def mono_to_foa_static(x, n_frames, sample_rate):
+    """
+    Uses the seld_ambisonics repo to spatialize mono files
+    """
+    encoder = AmbiEncoder(
+        AmbiFormat(ambi_order=1, sample_rate=sample_rate, ordering="ACN")
+    )
+    # Randomly select a value in the specified range
+    coord1 = random.choice(PHI)
+    coord2 = random.choice(ELE)
+    coord3 = random.choice(Z)
+    source = PositionalSource(x, Position(coord1, coord2, coord3, "polar"), sample_rate)
+    ambi = encoder.encode(source)
+    return ambi.data
+
+
+def mono_to_foa_dynamic(x, n_frames, sample_rate):
+    """
+    Uses the seld_ambisonics repo to spatialize mono files with dynamic
+    """
+
+    fmt = AmbiFormat(ambi_order=1, sample_rate=sample_rate, ordering="ACN")
+    encoder = AmbiEncoder(fmt)
+
+    n_positions = random.choice(N_POSITIONS)
+
+    windows = np.random.dirichlet(np.ones(n_positions), size=1)[0]
+
+    windows = windows * n_frames
+
+    x_positions = []
+    positions = []
+    p = 0
+    for i in range(n_positions):
+        # Randomly select a value in the specified range
+        coord1 = random.choice(PHI)
+        coord2 = random.choice(ELE)
+        coord3 = 1.0  # unit radius
+
+        for j in range(round(windows[i])):
+            if j > np.random.randint(low=5, high=12):
+                positions.append((coord1, coord2, coord3))
+                x_positions.append(p)
+            p = p + 1
+
+    X_Y_Spline = make_interp_spline(x_positions, positions, k=2)  # order = 2
+
+    _X = np.arange(0, n_frames)
+
+    positions = X_Y_Spline(_X)
+
+    positions = [Position(p[0], p[1], p[2], "polar") for p in positions]
+
+    source = MovingSource(x, positions, rate=sample_rate)
+
+    ambi = AmbisonicArray(np.zeros((x.shape[0], fmt.num_channels)), fmt)
+    while source.tic():
+        encoder.encode_frame(source, ambi, source.cur_idx)
+
+    return ambi.data
+
+
+def mono_to_foa_reverb(x, n_frames, sample_rate):
+    """
+    Uses real Impulse Responses to spatialize mono files
+    """
+    # Randomly select one of the IRs
+    ir_name = random.choice(IR_LIST)
+    # Open IR
+    ir_input, _ = sf.read(ir_name, dtype="float32")
+    # Convert input mono wav into 4 channels to convolve with the 4ch IRs
+    wav_4ch = np.repeat(x[:, np.newaxis], 4, axis=1)
+    # Convolve the wav signal with the IRs. The mode='same' ensures the output with the same input dimension
+    conv = scipy.signal.convolve(wav_4ch, ir_input, mode="same", method="auto")
+    return conv
 
 
 def _next_greater_power_of_2(x):
@@ -77,21 +173,24 @@ class FileEventDataset(FileAudioDataset):
 
         if self.pad:
             if self.pad_max:
-                assert self.max_sample_size is not None, \
-                    "max_sample_size must be defined"
+                assert (
+                    self.max_sample_size is not None
+                ), "max_sample_size must be defined"
                 target_size = self.max_sample_size
             else:
                 target_size = min(max(sizes), self.max_sample_size)
         else:
             target_size = min(min(sizes), self.max_sample_size)
 
-        collated_sources = sources[0].new_zeros(len(sources),
-                                                sources[0].shape[0],
-                                                target_size)
+        collated_sources = sources[0].new_zeros(
+            len(sources), sources[0].shape[0], target_size
+        )
         padding_mask = (
-            torch.BoolTensor(collated_sources.shape[0],
-                             collated_sources.shape[2]).fill_(
-                False) if self.pad else None
+            torch.BoolTensor(
+                collated_sources.shape[0], collated_sources.shape[2]
+            ).fill_(False)
+            if self.pad
+            else None
         )
         for i, (source, size) in enumerate(zip(sources, sizes)):
             diff = size - target_size
@@ -100,14 +199,11 @@ class FileEventDataset(FileAudioDataset):
             elif diff < 0:
                 assert self.pad
                 collated_sources[i] = torch.cat(
-                    [source, source.new_full(
-                        (sources[0].shape[0], -diff), 0.0)],
-                    dim=1
+                    [source, source.new_full((sources[0].shape[0], -diff), 0.0)], dim=1
                 )
                 padding_mask[i, diff:] = True
             else:
-                collated_sources[i] = self.crop_to_max_size(source,
-                                                            target_size)
+                collated_sources[i] = self.crop_to_max_size(source, target_size)
 
         if self.audio_transforms is not None:
             collated_sources = self.audio_transforms(collated_sources)
@@ -123,10 +219,8 @@ class FileEventDataset(FileAudioDataset):
             bucket = max(self._bucketed_sizes[s["id"]] for s in samples)
             num_pad = bucket - collated_sources.size(-1)
             if num_pad:
-                input["source"] = self._bucket_tensor(
-                    collated_sources, num_pad, 0)
-                input["padding_mask"] = self._bucket_tensor(
-                    padding_mask, num_pad, True)
+                input["source"] = self._bucket_tensor(collated_sources, num_pad, 0)
+                input["padding_mask"] = self._bucket_tensor(padding_mask, num_pad, True)
 
         if self.compute_mask_indices:
             B = input["source"].size(0)
@@ -152,15 +246,13 @@ class FileEventDataset(FileAudioDataset):
         return out
 
     def postprocess(self, feats, curr_sample_rate):
-
         if curr_sample_rate != self.sample_rate:
-            raise Exception(
-                f"sample rate: {curr_sample_rate}, need {self.sample_rate}")
+            raise Exception(f"sample rate: {curr_sample_rate}, need {self.sample_rate}")
 
         if self.normalize:
             with torch.no_grad():
                 if self.norm_per_channel:
-                    feats = F.layer_norm(feats, (feats.shape[-1], ))
+                    feats = F.layer_norm(feats, (feats.shape[-1],))
                 else:
                     feats = F.layer_norm(feats, feats.shape)
         return feats
@@ -178,7 +270,6 @@ class FileEventDataset(FileAudioDataset):
         return wav[..., start:end]
 
     def __getitem__(self, index):
-
         samples = super().__getitem__(index)
 
         samples["source"] = samples["source"].T  # (C, T)
@@ -199,7 +290,11 @@ class FileEventSpecDataset(FileEventDataset):
         pad_max=False,
         normalize=False,
         norm_per_channel=False,
-        spec_normalize=False,
+        norm_spec_foaiv=True,
+        spec_normalize=True,
+        norm_center_scale=False,
+        center_scale_spec4ch=[0.0, 1.0],
+        center_scale_foaiv=[0.0, 1.0],
         spectrogram_1d=True,
         num_buckets=0,
         audio_transforms=None,
@@ -207,37 +302,48 @@ class FileEventSpecDataset(FileEventDataset):
         n_mels=64,
         hop_len_s=0.005,  # 5ms
         spec_augment=False,
+        augment_foaiv=True,
         time_mask_F=21,
         time_mask_T=20,
+        n_time_masks=1,
+        n_freq_masks=1,
+        iid_masks=False,
+        mask_prob=1.0,
+        zero_masking=True,
         gammatone_filter_banks=False,
     ):
-        RawAudioDataset.__init__(self,
-                                 sample_rate=sample_rate,
-                                 max_sample_size=max_sample_size,
-                                 min_sample_size=min_sample_size,
-                                 shuffle=shuffle,
-                                 pad=pad,
-                                 normalize=normalize
-                                 )
+        RawAudioDataset.__init__(
+            self,
+            sample_rate=sample_rate,
+            max_sample_size=max_sample_size,
+            min_sample_size=min_sample_size,
+            shuffle=shuffle,
+            pad=pad,
+            normalize=normalize,
+        )
 
         self.raw_audio_input = raw_audio_input
 
-        self.hop_len = int(hop_len_s*self.sample_rate)
+        self.hop_len = int(hop_len_s * self.sample_rate)
         self.win_len = 2 * self.hop_len
         self.n_fft = _next_greater_power_of_2(self.win_len)
 
         if self.raw_audio_input:
-            self.spec_transform = Spectrogram(n_fft=self.n_fft,
-                                              win_length=self.win_len,
-                                              hop_length=self.hop_len,
-                                              power=None,
-                                              pad_mode='constant')
+            self.spec_transform = Spectrogram(
+                n_fft=self.n_fft,
+                win_length=self.win_len,
+                hop_length=self.hop_len,
+                power=None,
+                pad_mode="constant",
+            )
 
-            self.melscale_transform = MelScale(sample_rate=self.sample_rate,
-                                               mel_scale='slaney',
-                                               n_mels=n_mels,
-                                               norm=None,
-                                               n_stft=self.n_fft // 2 + 1)
+            self.melscale_transform = MelScale(
+                sample_rate=self.sample_rate,
+                mel_scale="slaney",
+                n_mels=n_mels,
+                norm=None,
+                n_stft=self.n_fft // 2 + 1,
+            )
 
             self.amp2db_transform = AmplitudeToDB()
 
@@ -273,72 +379,107 @@ class FileEventSpecDataset(FileEventDataset):
 
         self.set_bucket_info(num_buckets)
 
+        self.norm_center_scale = norm_center_scale
+        self.center_scale_spec4ch = center_scale_spec4ch
+        self.center_scale_foaiv = center_scale_foaiv
+
+        self.norm_spec_foaiv = norm_spec_foaiv
         self.norm_per_channel = norm_per_channel
         self.random_crop = random_crop
         self.pad_max = pad_max
 
         self.audio_transforms = audio_transforms
 
+        self.augment_foaiv = augment_foaiv
         if spec_augment:
-            logger.info(f"Using spec-augment:\n"
-                        f"hop_len: {self.hop_len}\n"
-                        f"time_mask_F: {time_mask_F},\n"
-                        f"time_mask_T: {time_mask_T}")
+            logger.info(
+                f"Using spec-augment:\n"
+                f"hop_len: {self.hop_len}\n"
+                f"time_mask_F: {time_mask_F},\n"
+                f"time_mask_T: {time_mask_T},\n"
+                f"n_freq_masks: {n_freq_masks},\n"
+                f"n_time_masks: {n_time_masks},\n"
+                f"iid_masks: {iid_masks},\n"
+                f"mask_prob: {mask_prob}"
+            )
 
-            self.spec_aug_transform = torch.nn.Sequential(
-                TimeStretch(hop_length=self.hop_len,
-                            fixed_rate=1.0),
-                FrequencyMasking(freq_mask_param=time_mask_F),
-                TimeMasking(time_mask_param=time_mask_T),
+            self.spec_aug_transform = SpecAugment(
+                n_time_masks=n_time_masks,
+                n_freq_masks=n_freq_masks,
+                time_mask_param=time_mask_T,
+                freq_mask_param=time_mask_F,
+                iid_masks=iid_masks,
+                p=mask_prob,
+                zero_masking=zero_masking,
             )
         else:
             self.spec_aug_transform = None
 
         if self.raw_audio_input and gammatone_filter_banks:
             fb = gammatone_fbanks.gammatone_filter_banks(
-                nfilts=n_mels, nfft=self.n_fft, fs=self.sample_rate, scale='descendant')[0].T
+                nfilts=n_mels, nfft=self.n_fft, fs=self.sample_rate, scale="descendant"
+            )[0].T
             self.melscale_transform.fb = torch.from_numpy(fb).float()
 
         if self.raw_audio_input:
             self.mel_wts = self.melscale_transform.fb
 
     def length_spectrogram(self, wav):
-        return int(np.floor(wav/(self.win_len - self.hop_len)) + 1)
+        return int(np.floor(wav / (self.win_len - self.hop_len)) + 1)
 
     def _get_foa_intensity_vectors(self, linear_spectra):
-        IVx = torch.real(torch.conj(
-            linear_spectra[:, :, 0]) * linear_spectra[:, :, 3])
-        IVy = torch.real(torch.conj(
-            linear_spectra[:, :, 0]) * linear_spectra[:, :, 1])
-        IVz = torch.real(torch.conj(
-            linear_spectra[:, :, 0]) * linear_spectra[:, :, 2])
+        IVx = torch.real(torch.conj(linear_spectra[:, :, 0]) * linear_spectra[:, :, 3])
+        IVy = torch.real(torch.conj(linear_spectra[:, :, 0]) * linear_spectra[:, :, 1])
+        IVz = torch.real(torch.conj(linear_spectra[:, :, 0]) * linear_spectra[:, :, 2])
 
-        normal = torch.sqrt(IVx**2 + IVy**2 + IVz**2) + eps
+        normal = (
+            eps
+            + (
+                torch.abs(linear_spectra[:, :, 0]) ** 2
+                + torch.abs(linear_spectra[:, :, 1]) ** 2
+                + torch.abs(linear_spectra[:, :, 2]) ** 2
+                + torch.abs(linear_spectra[:, :, 3]) ** 2
+            )
+            / 2.0
+        )
+
+        # normal = torch.sqrt(IVx**2 + IVy**2 + IVz**2) + eps
         IVx = torch.mm(IVx / normal, self.mel_wts)
         IVy = torch.mm(IVy / normal, self.mel_wts)
         IVz = torch.mm(IVz / normal, self.mel_wts)
 
         # we are doing the following instead of simply concatenating to keep
         # the processing similar to mel_spec and gcc
-        foa_iv = torch.stack((IVx, IVy, IVz), dim=-1)
-        if self.spectrogram_1d:
-            foa_iv = foa_iv.reshape(foa_iv.shape[0], -1)  # (192, T)
-        return foa_iv.permute(2, 1, 0)
+        foa_iv = torch.stack((IVx, IVy, IVz), dim=-1)  # (T, 64, 3)
+        foa_iv = foa_iv.permute(2, 1, 0)  # (3, 64, T)
+        return foa_iv
 
-    def postprocess_spec(self, feats):
-
+    def postprocess_spec(self, feats, augment=True, foa_iv=False):
         assert feats.dtype == torch.float32, feats.dtype
 
         if self.spec_normalize:
             with torch.no_grad():
                 if self.norm_per_channel:
-                    feats = F.layer_norm(feats, (feats.shape[-1], ))
+                    feats = F.layer_norm(feats, (feats.shape[-2], feats.shape[-1]))
                 else:
-                    feats = F.layer_norm(feats, feats.shape)
+                    if self.norm_center_scale:
+                        if foa_iv:
+                            feats = (
+                                feats - self.center_scale_foaiv[0]
+                            ) / self.center_scale_foaiv[1]
+                        else:
+                            feats = (
+                                feats - self.center_scale_spec4ch[0]
+                            ) / self.center_scale_spec4ch[1]
+                    else:
+                        feats = F.layer_norm(feats, feats.shape)
+
+        # apply SpecAugment method
+        if (self.spec_aug_transform is not None) and augment:
+            feats = self.spec_aug_transform(feats)
         return feats
 
     def __getitem__(self, index):
-
         if self.raw_audio_input:
             samples = {"id": index}
             fn = self.fnames[index]
@@ -346,6 +487,20 @@ class FileEventSpecDataset(FileEventDataset):
             fname = f"{self.root_dir}/{fn}"
 
             wav, curr_sample_rate = sf.read(fname)
+            if len(wav.shape) == 1 or wav.shape[0] == 1:
+                """
+                Randomly select one of the functions, mono_to_foa_dynamic which prob of 0.7 and mono_to_foa_reverb 0.3
+                The reason of the weighted choices is that there are just 67 IRs each one with one direction, so...
+                The mono_to_foa_dynamic generates non-reverberant outputs with much more different directions
+                """
+                foa_function = random.choices(
+                    [mono_to_foa_static, mono_to_foa_reverb], [0.7, 0.3]
+                )[0]
+                if wav.shape[0] == 1:
+                    wav = wav.squeeze(0)
+                wav = foa_function(wav, self.length_spectrogram(len(wav)), self.sample_rate)
+
+            assert wav.shape[-1] == 4, wav.shape
             feats = torch.from_numpy(wav).float()
             feats = self.postprocess(feats, curr_sample_rate).T  # (C, T)
 
@@ -355,25 +510,33 @@ class FileEventSpecDataset(FileEventDataset):
             fn = self.fnames[index]
             path_or_fp = f"{self.root_dir}/{fn}"
 
-            arr = np.load(path_or_fp, mmap_mode="r")  # (7, T, 64)
+            arr = np.load(path_or_fp, mmap_mode="r")  # (7, 64, T)
             feat = torch.from_numpy(arr)
 
-        feat = self.postprocess_spec(feat)
+            feat = self.postprocess_spec(feat)
 
-        samples["source"] = feat  # (7, T, 64) or (448, T)
+            # apply SpecAugment method
+            if self.spec_aug_transform is not None:
+                feat = self.spec_aug_transform(feat)
+
+        samples["source"] = feat  # (7, 64, T) or (448, T)
 
         return samples
 
     def extract_feat_spectrogram(self, source):
-
         if self.audio_transforms is not None:
             source = self.audio_transforms(source.unsqueeze(0)).squeeze(0)
 
         # get spectrogram (4, 513, T)
         spec = self.spec_transform(source)
 
-        # get intensity vector (3, 64, T) or (192, T)
+        # get intensity vector (3, 64, T)
         foa_iv = self._get_foa_intensity_vectors(spec.permute(2, 1, 0))
+
+        if self.norm_spec_foaiv:
+            foa_iv = self.postprocess_spec(foa_iv,
+                                           augment=self.augment_foaiv,
+                                           foa_iv=True)
 
         # get mel-spectrogram (4, 64, T)
         melscale_spect = self.melscale_transform(spec.abs().pow(2))
@@ -381,34 +544,18 @@ class FileEventSpecDataset(FileEventDataset):
         # get logmel-spectrogram (4, 64, T)
         logmel_spec = self.amp2db_transform(melscale_spect)
 
-        # apply SpecAugment method
-        if self.spec_aug_transform is not None:
-            logmel_spec = self.spec_aug_transform(logmel_spec)
+        # normalize and augment if enabled
+        logmel_spec = self.postprocess_spec(logmel_spec, foa_iv=False)
 
-        if self.spectrogram_1d:
-            # convert (4, 64, T) to (256, T)
-            C, N, T = logmel_spec.shape
-            logmel_spec = logmel_spec.reshape(C*N, T)
-
-        # concatenate logmel-spectrogram with foa iv (7, 64, T) or (448, T)
+        # concatenate logmel-spectrogram with foa iv (7, 64, T)
         feat = torch.cat((logmel_spec, foa_iv), dim=0)
 
-        if not self.spectrogram_1d:
-            feat = feat.transpose(1, 2)  # (7, 64, T) -> (7, T, 64)
+        # convert (7, 64, T) to (448, T)
+        if self.spectrogram_1d:
+            C, N, T = feat.shape
+            feat = feat.reshape(C * N, T)
 
         return feat
-
-    def crop_to_max_size(self, spec, target_size):
-        size = spec.shape[1]
-        diff = size - target_size
-        if diff <= 0:
-            return spec
-
-        start, end = 0, target_size
-        if self.random_crop:
-            start = np.random.randint(0, diff + 1)
-            end = size - diff + start
-        return spec[:, start:end, :]
 
     def collater(self, samples):
         samples = [s for s in samples if s["source"] is not None]
@@ -416,12 +563,13 @@ class FileEventSpecDataset(FileEventDataset):
             return {}
 
         sources = [s["source"] for s in samples]
-        sizes = [s.shape[1] for s in sources]
+        sizes = [s.shape[-1] for s in sources]
 
         if self.pad:
             if self.pad_max:
-                assert self.max_sample_size is not None, \
-                    "max_sample_size must be defined"
+                assert (
+                    self.max_sample_size is not None
+                ), "max_sample_size must be defined"
                 target_size = self.max_sample_size
             else:
                 target_size = min(max(sizes), self.max_sample_size)
@@ -429,21 +577,25 @@ class FileEventSpecDataset(FileEventDataset):
             target_size = min(min(sizes), self.max_sample_size)
 
         if self.spectrogram_1d:
-            collated_sources = sources[0].new_zeros(len(sources),
-                                                    sources[0].shape[0],
-                                                    target_size)  # (B, 448, T)
+            collated_sources = sources[0].new_zeros(
+                len(sources), sources[0].shape[0], target_size
+            )  # (B, 448, T)
         else:
-            # (B, 7, T, 64)
-            collated_sources = sources[0].new_zeros(len(sources),
-                                                    sources[0].shape[0],
-                                                    target_size,
-                                                    sources[0].shape[2])
+            collated_sources = sources[0].new_zeros(
+                len(sources),
+                sources[0].shape[0],
+                sources[0].shape[1],
+                target_size,
+            )  # (B, 7, 64, T)
 
         padding_mask = (
-            torch.BoolTensor(collated_sources.shape[0],
-                             collated_sources.shape[-2]).fill_(
-                False) if self.pad else None
+            torch.BoolTensor(
+                collated_sources.shape[0], collated_sources.shape[-1]
+            ).fill_(False)
+            if self.pad
+            else None
         )
+
         for i, (source, size) in enumerate(zip(sources, sizes)):
             diff = size - target_size
             if diff == 0:
@@ -452,22 +604,27 @@ class FileEventSpecDataset(FileEventDataset):
                 assert self.pad
                 if self.spectrogram_1d:
                     collated_sources[i] = torch.cat(
-                        [source, source.new_full(
-                            (sources[0].shape[0], -diff), 0.0)],
-                        dim=1
+                        [source, source.new_full((sources[0].shape[0], -diff), 0.0)],
+                        dim=-1,
                     )
                 else:
                     collated_sources[i] = torch.cat(
-                        [source, source.new_full(
-                            (sources[0].shape[0],
-                             -diff,
-                             sources[0].shape[2]), 0.0)],
-                        dim=1
+                        [
+                            source,
+                            source.new_full(
+                                (
+                                    sources[0].shape[0],
+                                    sources[0].shape[1],
+                                    -diff,
+                                ),
+                                0.0,
+                            ),
+                        ],
+                        dim=-1,
                     )
                 padding_mask[i, diff:] = True
             else:
-                collated_sources[i] = self.crop_to_max_size(source,
-                                                            target_size)
+                collated_sources[i] = self.crop_to_max_size(source, target_size)
 
         input = {"source": collated_sources}
         out = {"id": torch.LongTensor([s["id"] for s in samples])}
@@ -479,10 +636,8 @@ class FileEventSpecDataset(FileEventDataset):
             bucket = max(self._bucketed_sizes[s["id"]] for s in samples)
             num_pad = bucket - collated_sources.size(-1)
             if num_pad:
-                input["source"] = self._bucket_tensor(
-                    collated_sources, num_pad, 0)
-                input["padding_mask"] = self._bucket_tensor(
-                    padding_mask, num_pad, True)
+                input["source"] = self._bucket_tensor(collated_sources, num_pad, 0)
+                input["padding_mask"] = self._bucket_tensor(padding_mask, num_pad, True)
 
         out["net_input"] = input
         return out
