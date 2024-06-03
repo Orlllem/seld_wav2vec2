@@ -1,2 +1,2 @@
 defaults:
-  - ft_dataset_tau2019: tau_2019_ts47520_str10000
+  - ft_dataset_tau2019: tau_2019_raw_ts47520
