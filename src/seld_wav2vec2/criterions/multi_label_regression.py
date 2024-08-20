@@ -1,7 +1,5 @@
-import collections
-import json
 import math
-import os
+import random
 from dataclasses import dataclass, field
 from typing import Any, Optional, Tuple
 
@@ -9,25 +7,27 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from fairseq import metrics, utils
+from fairseq import utils
 from fairseq.criterions import FairseqCriterion, register_criterion
 from fairseq.dataclass import FairseqDataclass
+from fairseq.logging import metrics
 from omegaconf import II
-from sklearn.metrics import multilabel_confusion_matrix
-from sklearn.utils import class_weight
-from torch.linalg import vector_norm
+from sklearn.metrics import confusion_matrix, multilabel_confusion_matrix
 from torchvision.ops import sigmoid_focal_loss
 
-from seld_wav2vec2.criterions.evaluation_metrics import (
-    compute_doa_scores_regr_xyz,
-    compute_sed_scores,
-    early_stopping_metric,
-)
+from seld_wav2vec2.utils import torch_to_numpy
 
 eps = torch.finfo(torch.float32).eps
 
 # label frame resolution (label_frame_res)
 nb_label_frames_1s_100ms = 10  # 1/label_hop_len_s = 1/0.1
+
+
+def compute_class_weight_labels(labels, num_classes):
+    label_counts = np.bincount(labels, minlength=num_classes)
+    weight = np.where(label_counts == 0, 0.0, 1 / label_counts)
+    weight = weight / sum(weight)
+    return weight
 
 
 def sigmoid(x):
@@ -43,128 +43,6 @@ class SigmoidSchedule:
     def __call__(self, step):
         x = self.steps[step]
         return self.a_min + sigmoid(x) * (self.a_max - self.a_min)
-
-
-class AdaFocal(nn.Module):
-    def __init__(
-        self,
-        num_bins=15,
-        adafocal_lambda=1.0,
-        adafocal_gamma_initial=1.0,
-        adafocal_gamma_max=20.0,
-        adafocal_gamma_min=-2.0,
-        adafocal_switch_pt=0.2,
-        update_gamma_every=-1,
-        reduction="sum",
-    ):
-        super().__init__()
-
-        self.num_bins = num_bins
-        self.lamda = adafocal_lambda
-        self.gamma_initial = adafocal_gamma_initial
-        self.switch_pt = adafocal_switch_pt
-        self.gamma_max = adafocal_gamma_max
-        self.gamma_min = adafocal_gamma_min
-        self.update_gamma_every = update_gamma_every
-        self.reduction = reduction
-
-        # This initializes the bin_stats variable
-        self.bin_stats = collections.defaultdict(dict)
-        for bin_no in range(self.num_bins):
-            self.bin_stats[bin_no]["lower_boundary"] = bin_no * (1 / self.num_bins)
-            self.bin_stats[bin_no]["upper_boundary"] = (bin_no + 1) * (
-                1 / self.num_bins
-            )
-            self.bin_stats[bin_no]["gamma"] = self.gamma_initial
-
-    # This function updates the bin statistics which are used by the Adafocal loss at every epoch.
-    def update_bin_stats(self, val_adabin_dict):
-        for bin_no in range(self.num_bins):
-            # This is the Adafocal gamma update rule
-            prev_gamma = self.bin_stats[bin_no]["gamma"]
-            exp_term = val_adabin_dict[bin_no]["calibration_gap"]
-            if prev_gamma > 0:
-                next_gamma = prev_gamma * math.exp(self.lamda * exp_term)
-            else:
-                next_gamma = prev_gamma * math.exp(-self.lamda * exp_term)
-            # This switches between focal and inverse-focal loss when required.
-            if abs(next_gamma) < self.switch_pt:
-                if next_gamma > 0:
-                    next_gamma = -self.switch_pt
-                else:
-                    next_gamma = self.switch_pt
-            self.bin_stats[bin_no]["gamma"] = max(
-                min(next_gamma, self.gamma_max), self.gamma_min
-            )  # gamma-clipping
-            self.bin_stats[bin_no]["lower_boundary"] = val_adabin_dict[bin_no][
-                "lower_bound"
-            ]
-            self.bin_stats[bin_no]["upper_boundary"] = val_adabin_dict[bin_no][
-                "upper_bound"
-            ]
-        # This saves the "bin_stats" to a text file.
-        save_file = os.path.join(self.args.save_path, "val_bin_stats.txt")
-        with open(save_file, "a") as write_file:
-            json.dump(self.bin_stats, write_file)
-            write_file.write("\n")
-        return
-
-    # This function selects the gammas for each sample based on which bin it falls into.
-    def get_gamma_per_sample(self, pt):
-        gamma_list = []
-        batch_size = pt.shape[0]
-        for i in range(batch_size):
-            pt_sample = pt[i].item()
-            for bin_no, stats in self.bin_stats.items():
-                if bin_no == 0 and pt_sample < stats["upper_boundary"]:
-                    break
-                elif (
-                    bin_no == self.num_bins - 1 and pt_sample >= stats["lower_boundary"]
-                ):
-                    break
-                elif (
-                    pt_sample >= stats["lower_boundary"]
-                    and pt_sample < stats["upper_boundary"]
-                ):
-                    break
-            gamma_list.append(stats["gamma"])
-        return torch.tensor(gamma_list)
-
-    # This computes the loss value to be returned for back-propagation.
-    def forward(self, inputs, targets):
-
-        ce_loss = F.binary_cross_entropy_with_logits(
-            inputs, targets.float(), reduction="none"
-        ).reshape(-1)
-
-        p = torch.sigmoid(inputs)
-
-        pt = p * targets + (1 - p) * (1 - targets)
-        pt = pt.reshape(-1)
-
-        gamma = self.get_gamma_per_sample(pt).to(pt.device)
-        gamma_sign = torch.sign(gamma)
-        gamma_mag = torch.abs(gamma)
-        pt = gamma_sign * pt
-
-        loss = ce_loss * ((1 - pt + eps) ** gamma_mag)
-
-        if self.reduction == "mean":
-            loss = loss.mean()
-        elif self.reduction == "sum":
-            loss = loss.sum()
-
-        return loss
-
-
-def schedule_weight(current_step, boundaries, values):
-    # boundaries.append(float("inf"))
-    # values.append(0)
-
-    # check boundaries
-    # first index in 'boundaries' greater than current_step
-    s = next((x[0] for x in enumerate(boundaries) if x[1] > current_step), -1)
-    return values[s - 1]
 
 
 def reshape_3Dto2D(array):
@@ -207,6 +85,78 @@ class LogCoshLoss(torch.nn.Module):
         return torch.sum(torch.log(torch.cosh(ey_t + self.eps)))
 
 
+class SigmoidFocalLoss(torch.nn.Module):
+    def __init__(self, alpha=-1.0, gamma=2.0, reduction="sum"):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        return sigmoid_focal_loss(
+            inputs=inputs,
+            targets=targets,
+            alpha=self.alpha,
+            gamma=self.gamma,
+            reduction=self.reduction,
+        )
+
+
+class AsymmetricLoss(nn.Module):
+    def __init__(
+        self,
+        gamma_neg=4,
+        gamma_pos=1,
+        clip=0.05,
+        eps=1e-8,
+        disable_torch_grad_focal_loss=True,
+    ):
+        super(AsymmetricLoss, self).__init__()
+
+        self.gamma_neg = gamma_neg
+        self.gamma_pos = gamma_pos
+        self.clip = clip
+        self.disable_torch_grad_focal_loss = disable_torch_grad_focal_loss
+        self.eps = eps
+
+    def forward(self, x, y):
+        """ "
+        Parameters
+        ----------
+        x: input logits
+        y: targets (multi-label binarized vector)
+        """
+
+        # Calculating Probabilities
+        x_sigmoid = torch.sigmoid(x)
+        xs_pos = x_sigmoid
+        xs_neg = 1 - x_sigmoid
+
+        # Asymmetric Clipping
+        if self.clip is not None and self.clip > 0:
+            xs_neg = (xs_neg + self.clip).clamp(max=1)
+
+        # Basic CE calculation
+        los_pos = y * torch.log(xs_pos.clamp(min=self.eps))
+        los_neg = (1 - y) * torch.log(xs_neg.clamp(min=self.eps))
+        loss = los_pos + los_neg
+
+        # Asymmetric Focusing
+        if self.gamma_neg > 0 or self.gamma_pos > 0:
+            if self.disable_torch_grad_focal_loss:
+                torch.set_grad_enabled(False)
+            pt0 = xs_pos * y
+            pt1 = xs_neg * (1 - y)  # pt = p if t > 0 else 1-p
+            pt = pt0 + pt1
+            one_sided_gamma = self.gamma_pos * y + self.gamma_neg * (1 - y)
+            one_sided_w = torch.pow(1 - pt, one_sided_gamma)
+            if self.disable_torch_grad_focal_loss:
+                torch.set_grad_enabled(True)
+            loss *= one_sided_w
+
+        return -loss.sum()
+
+
 @dataclass
 class MultitaskSedDoaCriterionConfig(FairseqDataclass):
     report_accuracy: bool = field(
@@ -220,51 +170,34 @@ class MultitaskSedDoaCriterionConfig(FairseqDataclass):
         metadata={"help": "weights for loss terms"},
     )
     doa_size: int = II("model.doa_size")
-    use_labels_mask: Optional[bool] = field(
-        default=True,
+    use_labels_mask: Optional[float] = field(
+        default=1.0,
         metadata={
-            "help": "Whether to mask regression using using the labels or "
-            "predictions"
+            "help": "Whether to mask regression using using the labels or predictions"
         },
     )
     extend_mask: Optional[bool] = field(
-        default=True,
+        default=False,
         metadata={
             "help": "When mask is extended the model must produced regression"
             "logits of (B, T, doa_size*N_classes)"
         },
     )
-    constrain_r_unit: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Constraint sqrt(x^2 + y^2 + z^2)=1"},
+    class_type: Optional[str] = field(
+        default="CE",
+        metadata={"help": "type of classification loss (CE, FL, ASL)"},
     )
-    focal_loss: Optional[bool] = field(
-        default=False,
-        metadata={"help": "whether to use focal loss"},
-    )
-    focal_ada: Optional[bool] = field(
-        default=False,
-        metadata={"help": "whether to use ada-focal"},
-    )
-    focal_alpha: Optional[float] = field(
-        default=0.25,
-        metadata={"help": "focal loss alpha"},
-    )
-    focal_gamma: Optional[float] = field(
+    gamma: Any = field(
         default=2.0,
-        metadata={"help": "focal loss gamma"},
+        metadata={"help": "gamma parameter of loss"},
     )
-    focal_bw: Optional[bool] = field(
-        default=False,
-        metadata={"help": "whether to use focal loss with batching wise"},
+    clip: Optional[float] = field(
+        default=0.0,
+        metadata={"help": "clip parameter of loss"},
     )
     regr_type: Optional[str] = field(
         default="mse",
         metadata={"help": "regression loss type"},
-    )
-    constrain_r_unit_type: Optional[str] = field(
-        default="mse",
-        metadata={"help": "regression constraint loss type"},
     )
 
 
@@ -298,12 +231,16 @@ class MultitaskSedDoaGradNormCriterionConfig(MultitaskSedDoaCriterionConfig):
         default=1.0,
         metadata={"help": "gradnorm alpha parameter"},
     )
+    grad_norm_scale: Any = field(
+        default=2.0,
+        metadata={"help": "gradnorm scale weights parameter"},
+    )
     skip_grad_norm_for_n_updates: Optional[int] = field(
         default=0,
         metadata={"help": "skip grad-norm for N fine-tuned updates"},
     )
     num_updates: Optional[int] = field(
-        default=320000,
+        default=II("optimization.max_update"),
         metadata={"help": "num updates of training"},
     )
     grad_norm_x_range: Tuple[int, int] = field(
@@ -313,14 +250,18 @@ class MultitaskSedDoaGradNormCriterionConfig(MultitaskSedDoaCriterionConfig):
 
 
 @dataclass
-class AccDoataskSedDoaCriterionConfig(FairseqDataclass):
-    report_accuracy: bool = field(
-        default=True,
-        metadata={"help": "report accuracy metric"},
+class MultitaskSeldCriterionDiscConfig(MultitaskSedDoaCriterionConfig):
+    balance_doa_classes: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Balance the DOA labels by frequency"},
     )
-    sentence_avg: bool = II("optimization.sentence_avg")
-    nb_classes: int = II("model.target_length")
-    doa_size: int = II("model.doa_size")
+
+
+@dataclass
+class MultitaskSeldCriterionDiscGradNormConfig(
+    MultitaskSeldCriterionDiscConfig, MultitaskSedDoaGradNormCriterionConfig
+):
+    pass
 
 
 @register_criterion(
@@ -335,7 +276,7 @@ class MultitaskSedDoaSeqClassCriterion(FairseqCriterion):
         nb_classes=11,
         loss_weights=(1, 1),
         doa_size=2,
-        use_labels_mask=True,
+        use_labels_mask=1.0,
         extend_mask=True,
     ):
         super().__init__(task)
@@ -349,8 +290,23 @@ class MultitaskSedDoaSeqClassCriterion(FairseqCriterion):
 
         assert len(self.loss_weights) == 2
 
+        if use_labels_mask >= 1.0:
+            use_labels_mask = True
+        elif use_labels_mask <= 0:
+            use_labels_mask = False
+
         self.use_labels_mask = use_labels_mask
         self.extend_mask = extend_mask
+
+    def class_mask_type(self):
+        if isinstance(self.use_labels_mask, bool):
+            mask_type = self.use_labels_mask
+        else:
+            if random.random() <= self.use_labels_mask:
+                mask_type = True
+            else:
+                mask_type = False
+        return mask_type
 
     def forward(self, model, sample, reduce=True):
         """Compute the loss for the given sample.
@@ -377,7 +333,7 @@ class MultitaskSedDoaSeqClassCriterion(FairseqCriterion):
         }
         if self.report_accuracy:
             with torch.no_grad():
-                logits = net_output["class_encoder_out"]
+                logits = net_output["class_encoder_out"].float()
                 targets = sample["sed_labels"]
                 TP, TN, FP, FN = self.compute_metrics(logits, targets)
                 n_correct = np.sum(TP) + np.sum(TN)
@@ -395,10 +351,10 @@ class MultitaskSedDoaSeqClassCriterion(FairseqCriterion):
     def compute_metrics(self, logits, target):
         probs = torch.sigmoid(logits.float())
 
-        preds = (probs > 0.5).float().cpu().numpy()
+        preds = torch_to_numpy((probs > 0.5).float())
 
         cm = multilabel_confusion_matrix(
-            target.cpu().numpy(), preds, labels=self.labels
+            torch_to_numpy(target), preds, labels=self.labels
         )
 
         TN, FN, TP, FP = cm[:, 0, 0], cm[:, 1, 0], cm[:, 1, 1], cm[:, 0, 1]
@@ -406,9 +362,8 @@ class MultitaskSedDoaSeqClassCriterion(FairseqCriterion):
         return TP, TN, FP, FN
 
     def compute_loss(self, net_output, sample, reduce=True):
-        class_logits = net_output["class_encoder_out"]
-        reg_logits = net_output["regression_out"]
-
+        class_logits = net_output["class_encoder_out"].float()
+        reg_logits = net_output["regression_out"].float()
         class_labels = sample["sed_labels"].to(class_logits)
         reg_targets = sample["doa_labels"].to(reg_logits)
 
@@ -416,7 +371,7 @@ class MultitaskSedDoaSeqClassCriterion(FairseqCriterion):
             multi_label_loss = F.binary_cross_entropy_with_logits(
                 class_logits, class_labels, reduction="sum"
             ).float()
-            if self.use_labels_mask:
+            if self.class_mask_type():
                 class_mask = class_labels > 0.5
             else:
                 class_mask = torch.sigmoid(class_logits) > 0.5
@@ -521,152 +476,6 @@ class MultitaskSedDoaSeqClassCriterion(FairseqCriterion):
 
 
 @register_criterion(
-    "multitask_sed_doa_seqclass_cart_dcase_2019",
-    dataclass=MultitaskSedDoaCriterionConfig,
-)
-class MultitaskSeldSeqClassCartDcase2019Criterion(MultitaskSedDoaSeqClassCriterion):
-    def __init__(
-        self,
-        task,
-        sentence_avg,
-        report_accuracy=True,
-        nb_classes=11,
-        loss_weights=(1, 1),
-        doa_size=3,
-        use_labels_mask=True,
-        extend_mask=True,
-    ):
-        super().__init__(
-            task,
-            sentence_avg,
-            report_accuracy,
-            nb_classes,
-            loss_weights,
-            doa_size,
-            use_labels_mask,
-            extend_mask,
-        )
-
-    def forward(self, model, sample, reduce=True):
-        """Compute the loss for the given sample.
-
-        Returns a tuple with three elements:
-        1) the loss
-        2) the sample size, which is used as the denominator for the gradient
-        3) logging outputs to display while training
-        """
-        net_output = model(**sample["net_input"])
-        loss, multi_label_loss, reg_loss = self.compute_loss(
-            net_output, sample, reduce=reduce
-        )
-        sample_size = (
-            sample["sed_labels"].size(0) if self.sentence_avg else sample["ntokens"]
-        )
-        logging_output = {
-            "loss": loss.data,
-            "multi_label_loss": multi_label_loss.data,
-            "reg_loss": reg_loss.data,
-            "ntokens": sample["ntokens"],
-            "nsentences": sample["sed_labels"].size(0),
-            "sample_size": sample_size,
-        }
-        if self.report_accuracy:
-            with torch.no_grad():
-                class_logits = net_output["class_encoder_out"].float()
-                reg_logits = net_output["regression_out"].float()
-
-                class_labels = sample["sed_labels"].float()
-                reg_targets = sample["doa_labels"].float()
-
-                class_probs = torch.sigmoid(class_logits.float())
-                class_mask = class_probs > 0.5
-                class_preds = class_mask.float()
-
-                # ignore padded labels -100
-                class_pad_mask = class_labels < 0
-                class_labels[class_pad_mask] = torch.tensor(0).to(class_labels)
-
-                class_mask_extended = torch.cat([class_mask] * self.doa_size, dim=-1)
-
-                reg_logits[~class_mask_extended] = torch.tensor(0.0).to(reg_targets)
-                reg_logits = reg_logits.cpu().numpy()
-
-                class_preds = class_preds.cpu().numpy()
-                class_labels = class_labels.cpu().numpy()
-                reg_targets = reg_targets.cpu().numpy()
-
-                logging_output["y_pred_class"] = class_preds
-                logging_output["y_true_class"] = class_labels
-                logging_output["y_pred_reg"] = reg_logits
-                logging_output["y_true_reg"] = reg_targets
-
-        return loss, sample_size, logging_output
-
-    @classmethod
-    def reduce_metrics(cls, logging_outputs) -> None:
-        """Aggregate logging outputs from data parallel training."""
-        loss_sum = sum(log.get("loss", 0) for log in logging_outputs)
-        multi_label_loss_sum = sum(
-            log.get("multi_label_loss", 0) for log in logging_outputs
-        )
-        reg_loss_sum = sum(log.get("reg_loss", 0) for log in logging_outputs)
-
-        y_pred_class = np.concatenate(
-            [log.get("y_pred_class", 0) for log in logging_outputs], axis=0
-        )
-        y_true_class = np.concatenate(
-            [log.get("y_true_class", 0) for log in logging_outputs], axis=0
-        )
-        y_pred_reg = np.concatenate(
-            [log.get("y_pred_reg", 0) for log in logging_outputs], axis=0
-        )
-        y_true_reg = np.concatenate(
-            [log.get("y_true_reg", 0) for log in logging_outputs], axis=0
-        )
-
-        er_metric = compute_doa_scores_regr_xyz(
-            y_pred_reg, y_true_reg, y_pred_class, y_true_class
-        )
-
-        _doa_err, _frame_recall, _, _, _, _ = er_metric
-        doa_metric = [_doa_err, _frame_recall]
-
-        sed_metric = compute_sed_scores(
-            y_pred_class, y_true_class, nb_label_frames_1s_100ms
-        )
-        _er = sed_metric[0]
-        _f = sed_metric[1]
-
-        _seld_scr = early_stopping_metric(sed_metric, doa_metric)
-
-        ntokens = sum(log.get("ntokens", 0) for log in logging_outputs)
-        sample_size = sum(log.get("sample_size", 0) for log in logging_outputs)
-
-        metrics.log_scalar(
-            "loss", loss_sum / sample_size / math.log(2), sample_size, round=5
-        )
-        metrics.log_scalar(
-            "multi_label_loss_sum",
-            multi_label_loss_sum / ntokens / math.log(2),
-            ntokens,
-            round=5,
-        )
-        metrics.log_scalar(
-            "reg_loss_sum", reg_loss_sum / ntokens / math.log(2), ntokens, round=5
-        )
-
-        metrics.log_scalar("f1_score", _f * 100, round=5)
-        metrics.log_scalar("doa_error", _doa_err, round=5)
-        metrics.log_scalar("frame_recall", _frame_recall * 100, round=5)
-        if np.isnan(_er):
-            metrics.log_scalar("error_rate", 100, round=5)
-            metrics.log_scalar("seld_score", 1, round=5)
-        else:
-            metrics.log_scalar("error_rate", _er * 100, round=5)
-            metrics.log_scalar("seld_score", _seld_scr, round=5)
-
-
-@register_criterion(
     "multitask_sed_doa_audio_frame_class", dataclass=MultitaskSedDoaCriterionConfig
 )
 class MultitaskSeldAudioFrameCriterion(FairseqCriterion):
@@ -678,16 +487,12 @@ class MultitaskSeldAudioFrameCriterion(FairseqCriterion):
         nb_classes=11,
         loss_weights=(1, 1),
         doa_size=3,
-        use_labels_mask=True,
+        use_labels_mask=1.0,
         extend_mask=True,
-        constrain_r_unit=False,
-        focal_loss=False,
-        focal_ada=False,
-        focal_alpha=0.25,
-        focal_gamma=2.0,
-        focal_bw=False,
+        class_type="CE",
+        gamma=2.0,
+        clip=0,
         regr_type="mse",
-        constrain_r_unit_type="mse",
     ):
         super().__init__(task)
         self.sentence_avg = sentence_avg
@@ -700,15 +505,22 @@ class MultitaskSeldAudioFrameCriterion(FairseqCriterion):
 
         assert len(self.loss_weights) == 2
 
+        if use_labels_mask >= 1.0:
+            use_labels_mask = True
+        elif use_labels_mask <= 0:
+            use_labels_mask = False
+
         self.use_labels_mask = use_labels_mask
         self.extend_mask = extend_mask
-        self.constrain_r_unit = constrain_r_unit
 
-        self.focal_loss = focal_loss
-        self.focal_ada = focal_ada
-        self.focal_alpha = focal_alpha
-        self.focal_gamma = focal_gamma
-        self.focal_bw = focal_bw
+        if class_type == "FL":
+            self.class_loss = SigmoidFocalLoss(alpha=-1.0, gamma=gamma)
+        elif class_type == "ASL":
+            self.class_loss = AsymmetricLoss(
+                gamma_neg=gamma[0], gamma_pos=gamma[1], clip=clip
+            )
+        else:
+            self.class_loss = nn.BCEWithLogitsLoss(reduction="sum")
 
         if regr_type == "logcosh":
             self.regr_loss = LogCoshLoss()
@@ -717,15 +529,15 @@ class MultitaskSeldAudioFrameCriterion(FairseqCriterion):
         else:
             self.regr_loss = nn.MSELoss(reduction="sum")
 
-        if constrain_r_unit_type == "logcosh":
-            self.regr_r_unit_loss = LogCoshLoss()
-        elif constrain_r_unit_type == "mae":
-            self.regr_r_unit_loss = nn.L1Loss(reduction="sum")
+    def class_mask_type(self):
+        if isinstance(self.use_labels_mask, bool):
+            mask_type = self.use_labels_mask
         else:
-            self.regr_r_unit_loss = nn.MSELoss(reduction="sum")
-
-        if self.focal_ada:
-            self.ada_focal = AdaFocal(reduction="sum")
+            if random.random() <= self.use_labels_mask:
+                mask_type = True
+            else:
+                mask_type = False
+        return mask_type
 
     def forward(self, model, sample, reduce=True):
         """Compute the loss for the given sample.
@@ -752,7 +564,7 @@ class MultitaskSeldAudioFrameCriterion(FairseqCriterion):
         }
         if self.report_accuracy:
             with torch.no_grad():
-                logits = net_output["class_encoder_out"]
+                logits = net_output["class_encoder_out"].float()
                 targets = sample["sed_labels"]
 
                 # ignore padded labels -100
@@ -774,8 +586,8 @@ class MultitaskSeldAudioFrameCriterion(FairseqCriterion):
     def compute_metrics(self, logits, targets):
         probs = torch.sigmoid(logits.float())
 
-        preds = (probs > 0.5).float().cpu().numpy()
-        targets = targets.cpu().numpy()
+        preds = torch_to_numpy((probs > 0.5).float())
+        targets = torch_to_numpy(targets)
 
         TN, FN, TP, FP = 0, 0, 0, 0
         for i in range(len(targets)):
@@ -788,58 +600,24 @@ class MultitaskSeldAudioFrameCriterion(FairseqCriterion):
 
         return TP, TN, FP, FN
 
-    def compute_loss(self, net_output, sample, reduce=True, thr=0.5):
-        class_logits = net_output["class_encoder_out"]
-        reg_logits = net_output["regression_out"]
+    def compute_loss(self, net_output, sample, reduce=True):
+        class_logits = net_output["class_encoder_out"].float()
+        reg_logits = net_output["regression_out"].float()
 
         class_labels = sample["sed_labels"].to(class_logits)
         reg_targets = sample["doa_labels"].to(reg_logits)
 
         if self.training:
             # ignore padded labels -100
-            weights_pad_mask = class_labels >= 0
-            weights = (weights_pad_mask).to(class_logits)
-
             class_pad_mask = class_labels < 0
             class_labels[class_pad_mask] = torch.tensor(0.0).to(class_labels)
 
-            if self.focal_loss:
-                if self.focal_bw:
-                    class_labels_1d = class_labels.reshape(-1).cpu().numpy()
-                    unique_labels = np.unique(class_labels_1d)
-                    if len(unique_labels) > 1:
-                        class_weights = class_weight.compute_class_weight(
-                            "balanced", unique_labels, class_labels_1d
-                        )
-                        focal_alpha = class_weights[1] / sum(class_weights)
-                    elif all(unique_labels == [0]):
-                        focal_alpha = 0.0
-                    else:
-                        focal_alpha = 1.0
-                else:
-                    focal_alpha = self.focal_alpha
-                if self.focal_ada:
-                    multi_label_loss = self.ada_focal(
-                        class_logits,
-                        class_labels,
-                    )
-                else:
-                    multi_label_loss = sigmoid_focal_loss(
-                        class_logits,
-                        class_labels,
-                        alpha=focal_alpha,
-                        gamma=self.focal_gamma,
-                        reduction="sum",
-                    )
-            else:
-                multi_label_loss = F.binary_cross_entropy_with_logits(
-                    class_logits, class_labels, weight=weights, reduction="sum"
-                )
+            multi_label_loss = self.class_loss(class_logits, class_labels)
 
-            if self.use_labels_mask:
-                class_mask = class_labels > thr
+            if self.class_mask_type():
+                class_mask = class_labels > self.task.best_threshold
             else:
-                class_mask = torch.sigmoid(class_logits) > thr
+                class_mask = torch.sigmoid(class_logits) > self.task.best_threshold
 
             if self.extend_mask:
                 class_mask_extended = torch.cat([class_mask] * self.doa_size, dim=-1)
@@ -849,23 +627,6 @@ class MultitaskSeldAudioFrameCriterion(FairseqCriterion):
 
                 reg_loss = self.regr_loss(reg_logits_mask, reg_targets_mask)
 
-                if self.constrain_r_unit:
-                    B, T, N = class_labels.shape
-                    reg_logits = reg_logits.reshape((B, T, self.doa_size, N)).transpose(
-                        3, 2
-                    )
-                    reg_targets = reg_targets.reshape(
-                        (B, T, self.doa_size, N)
-                    ).transpose(3, 2)
-
-                    reg_logits_mask = reg_logits[class_mask]
-                    reg_targets_mask = reg_targets[class_mask]
-
-                    reg_norm = vector_norm(reg_logits_mask, dim=-1)
-                    reg_unit_loss = self.regr_r_unit_loss(
-                        reg_norm, torch.ones(reg_norm.shape).to(reg_norm)
-                    )
-                    reg_loss = reg_loss + reg_unit_loss
             else:
                 B, T, N = class_labels.shape
                 reg_logits = reg_logits.reshape((B, T, self.doa_size, N)).transpose(
@@ -879,13 +640,6 @@ class MultitaskSeldAudioFrameCriterion(FairseqCriterion):
                 reg_targets_mask = reg_targets[class_mask]
 
                 reg_loss = self.regr_loss(reg_logits_mask, reg_targets_mask)
-
-                if self.constrain_r_unit:
-                    reg_norm = vector_norm(reg_logits_mask, dim=-1)
-                    reg_unit_loss = self.regr_r_unit_loss(
-                        reg_norm, torch.ones(reg_norm.shape).to(reg_norm)
-                    )
-                    reg_loss = reg_loss + reg_unit_loss
 
             loss = (
                 self.loss_weights[0] * multi_label_loss
@@ -897,26 +651,9 @@ class MultitaskSeldAudioFrameCriterion(FairseqCriterion):
             class_pad_mask = class_labels < 0
             class_labels[class_pad_mask] = torch.tensor(0.0).to(class_labels)
 
-            if self.focal_loss:
-                if self.focal_ada:
-                    multi_label_loss = self.ada_focal(
-                        class_logits,
-                        class_labels,
-                    )
-                else:
-                    multi_label_loss = sigmoid_focal_loss(
-                        class_logits,
-                        class_labels,
-                        alpha=self.focal_alpha,
-                        gamma=self.focal_gamma,
-                        reduction="sum",
-                    )
-            else:
-                multi_label_loss = F.binary_cross_entropy_with_logits(
-                    class_logits, class_labels, reduction="sum"
-                )
+            multi_label_loss = self.class_loss(class_logits, class_labels)
 
-            class_mask = torch.sigmoid(class_logits) > thr
+            class_mask = torch.sigmoid(class_logits) > self.task.best_threshold
 
             if self.extend_mask:
                 class_mask_extended = torch.cat([class_mask] * self.doa_size, dim=-1)
@@ -926,25 +663,6 @@ class MultitaskSeldAudioFrameCriterion(FairseqCriterion):
 
                 reg_loss = self.regr_loss(reg_logits_mask, reg_targets_mask)
 
-                if self.constrain_r_unit:
-                    B, T, N = class_labels.shape
-                    reg_logits = reg_logits.reshape((B, T, self.doa_size, N)).transpose(
-                        3, 2
-                    )
-                    reg_targets = reg_targets.reshape(
-                        (B, T, self.doa_size, N)
-                    ).transpose(3, 2)
-
-                    reg_logits_mask = reg_logits[class_mask]
-                    reg_targets_mask = reg_targets[class_mask]
-
-                    reg_norm = vector_norm(reg_logits_mask, dim=-1)
-                    reg_unit_loss = F.mse_loss(
-                        reg_norm,
-                        torch.ones(reg_norm.shape).to(reg_norm),
-                        reduction="sum",
-                    )
-                    reg_loss = reg_loss + reg_unit_loss
             else:
                 B, T, N = class_labels.shape
                 reg_logits = reg_logits.reshape((B, T, self.doa_size, N)).transpose(
@@ -958,15 +676,6 @@ class MultitaskSeldAudioFrameCriterion(FairseqCriterion):
                 reg_targets_mask = reg_targets[class_mask]
 
                 reg_loss = self.regr_loss(reg_logits_mask, reg_targets_mask)
-
-                if self.constrain_r_unit:
-                    reg_norm = vector_norm(reg_logits_mask, dim=-1)
-                    reg_unit_loss = F.mse_loss(
-                        reg_norm,
-                        torch.ones(reg_norm.shape).to(reg_norm),
-                        reduction="sum",
-                    )
-                    reg_loss = reg_loss + reg_unit_loss
 
             loss = multi_label_loss + reg_loss
 
@@ -1039,31 +748,27 @@ class MultitaskSeldAudioFrameCartDcaseCriterion(MultitaskSeldAudioFrameCriterion
         doa_size=3,
         use_labels_mask=True,
         extend_mask=True,
-        constrain_r_unit=False,
-        focal_loss=False,
-        focal_alpha=0.25,
-        focal_gamma=2.0,
-        focal_bw=False,
+        class_type="CE",
+        gamma=2.0,
+        clip=0,
         regr_type="mse",
     ):
         super().__init__(
-            task,
-            sentence_avg,
-            report_accuracy,
-            nb_classes,
-            loss_weights,
-            doa_size,
-            use_labels_mask,
-            extend_mask,
-            constrain_r_unit,
-            focal_loss,
-            focal_alpha,
-            focal_gamma,
-            focal_bw,
-            regr_type,
+            task=task,
+            sentence_avg=sentence_avg,
+            report_accuracy=report_accuracy,
+            nb_classes=nb_classes,
+            loss_weights=loss_weights,
+            doa_size=doa_size,
+            use_labels_mask=use_labels_mask,
+            extend_mask=extend_mask,
+            class_type=class_type,
+            gamma=gamma,
+            clip=clip,
+            regr_type=regr_type,
         )
 
-    def forward(self, model, sample, reduce=True):
+    def step_forward_model(self, model, sample, reduce=True):
         """Compute the loss for the given sample.
 
         Returns a tuple with three elements:
@@ -1071,7 +776,14 @@ class MultitaskSeldAudioFrameCartDcaseCriterion(MultitaskSeldAudioFrameCriterion
         2) the sample size, which is used as the denominator for the gradient
         3) logging outputs to display while training
         """
-        net_output = model(**sample["net_input"])
+
+        training = self.training or self.task.cfg.segment_eval
+
+        if self.task.cfg.get("apply_record_inference_on_train", False) or (not training):
+            net_output, sample = self.task.inference_step(sample, model)
+        else:
+            net_output = model(**sample["net_input"])
+
         loss, multi_label_loss, reg_loss = self.compute_loss(
             net_output, sample, reduce=reduce
         )
@@ -1086,21 +798,28 @@ class MultitaskSeldAudioFrameCartDcaseCriterion(MultitaskSeldAudioFrameCriterion
             "nsentences": sample["sed_labels"].size(0),
             "sample_size": sample_size,
         }
+
+        return loss, sample_size, logging_output, net_output, sample
+
+    def forward(self, model, inputs, reduce=True):
+        loss, sample_size, logging_output, net_output, sample = (
+            self.step_forward_model(model, inputs, reduce=True)
+        )
+
         if self.report_accuracy and not self.training:
             with torch.no_grad():
-                class_logits = net_output["class_encoder_out"].float()
+                class_logits = net_output["class_encoder_out"].float()  # (B, T, N)
                 reg_logits = net_output["regression_out"].float()
-
-                class_labels = sample["sed_labels"].float()
-                reg_targets = sample["doa_labels"].float()
+                class_labels = sample["sed_labels"].to(class_logits)  # (B, T, N)
+                reg_targets = sample["doa_labels"].to(reg_logits)  # (B, T, 3N)
 
                 class_probs = torch.sigmoid(class_logits)
 
-                class_probs = class_probs.cpu().numpy()
-                class_labels = class_labels.cpu().numpy()
+                class_probs = torch_to_numpy(class_probs)
+                class_labels = torch_to_numpy(class_labels)
 
-                reg_logits = reg_logits.cpu().numpy()
-                reg_targets = reg_targets.cpu().numpy()
+                reg_logits = torch_to_numpy(reg_logits)
+                reg_targets = torch_to_numpy(reg_targets)
 
                 class_probs = reshape_3Dto2D(class_probs)
                 class_labels = reshape_3Dto2D(class_labels)
@@ -1142,84 +861,6 @@ class MultitaskSeldAudioFrameCartDcaseCriterion(MultitaskSeldAudioFrameCriterion
 
 
 @register_criterion(
-    "multitask_sed_doa_audio_frame_class_cart_dcase_doa_schedule",
-    dataclass=MultitaskSedDoaScheduleCriterionConfig,
-)
-class MultitaskSeldAudioFrameCartDcaseScheduleCriterion(
-    MultitaskSeldAudioFrameCartDcaseCriterion
-):
-    def __init__(
-        self,
-        task,
-        sentence_avg,
-        report_accuracy=True,
-        nb_classes=11,
-        loss_weights=(1, 1),
-        doa_size=3,
-        use_labels_mask=True,
-        extend_mask=True,
-        constrain_r_unit=False,
-        focal_loss=False,
-        focal_alpha=0.25,
-        focal_gamma=2.0,
-        focal_bw=False,
-        boundaries=[20000, 30000, 60000],
-        weights_values=[1.0, 11.0, 110.0],
-    ):
-        super().__init__(
-            task,
-            sentence_avg,
-            report_accuracy,
-            nb_classes,
-            loss_weights,
-            doa_size,
-            use_labels_mask,
-            extend_mask,
-            constrain_r_unit,
-            focal_loss,
-            focal_alpha,
-            focal_gamma,
-            focal_bw,
-        )
-
-        # assert self.loss_weights[0] == 1.0, "weight[0] must be 1.0"
-        # assert self.loss_weights[1] == 1.0, "weight[1] must be 1.0"
-
-        self.boundaries = boundaries
-        self.weights_values = weights_values
-
-    def forward(self, model, sample, reduce=True):
-        """Compute the loss for the given sample.
-
-        Returns a tuple with three elements:
-        1) the loss
-        2) the sample size, which is used as the denominator for the gradient
-        3) logging outputs to display while training
-        """
-
-        current_step = model.w2v_encoder.num_updates
-        reg_weight = schedule_weight(current_step, self.boundaries, self.weights_values)
-
-        self.loss_weights[1] = reg_weight
-
-        loss, sample_size, logging_output = super().forward(model, sample, reduce)
-
-        logging_output["reg_weight"] = reg_weight
-
-        return loss, sample_size, logging_output
-
-    @classmethod
-    def reduce_metrics(cls, logging_outputs) -> None:
-        super().reduce_metrics(logging_outputs)
-
-        reg_weight = [log.get("reg_weight", 0) for log in logging_outputs]
-
-        metrics.log_scalar(
-            "reg_weight", sum(reg_weight) / len(reg_weight), len(reg_weight), round=3
-        )
-
-
-@register_criterion(
     "multitask_sed_doa_audio_frame_class_cart_dcase_doa_dwa",
     dataclass=MultitaskSedDoaDwaCriterionConfig,
 )
@@ -1236,28 +877,26 @@ class MultitaskSeldAudioFrameCartDcaseDwaCriterion(
         doa_size=3,
         use_labels_mask=True,
         extend_mask=True,
-        constrain_r_unit=False,
-        focal_loss=False,
-        focal_alpha=0.25,
-        focal_gamma=2.0,
-        focal_bw=False,
+        class_type="CE",
+        gamma=2.0,
+        clip=0,
+        regr_type="mse",
         dwa_temperature=1,
         K=2,
     ):
         super().__init__(
-            task,
-            sentence_avg,
-            report_accuracy,
-            nb_classes,
-            loss_weights,
-            doa_size,
-            use_labels_mask,
-            extend_mask,
-            constrain_r_unit,
-            focal_loss,
-            focal_alpha,
-            focal_gamma,
-            focal_bw,
+            task=task,
+            sentence_avg=sentence_avg,
+            report_accuracy=report_accuracy,
+            nb_classes=nb_classes,
+            loss_weights=loss_weights,
+            doa_size=doa_size,
+            use_labels_mask=use_labels_mask,
+            extend_mask=extend_mask,
+            class_type=class_type,
+            gamma=gamma,
+            clip=clip,
+            regr_type=regr_type,
         )
         self.dwa_temperature = dwa_temperature
         self.loss_tm = []
@@ -1273,19 +912,17 @@ class MultitaskSeldAudioFrameCartDcaseDwaCriterion(
         """
 
         net_output = model(**sample["net_input"])
+        _, multi_label_loss, reg_loss = self.compute_loss(
+            net_output, sample, reduce=reduce
+        )
 
-        with torch.cuda.amp.autocast(dtype=torch.float32):
-            _, multi_label_loss, reg_loss = self.compute_loss(
-                net_output, sample, reduce=reduce
-            )
+        task_loss = torch.stack([multi_label_loss, reg_loss])
 
-            task_loss = torch.stack([multi_label_loss, reg_loss])
-
-            if self.training:
-                loss = self.compute_dwa(task_loss)
-                self.loss_tm.append(task_loss)
-            else:
-                loss = multi_label_loss + reg_loss
+        if self.training:
+            loss = self.compute_dwa(task_loss)
+            self.loss_tm.append(task_loss)
+        else:
+            loss = multi_label_loss + reg_loss
 
         sample_size = (
             sample["sed_labels"].size(0) if self.sentence_avg else sample["ntokens"]
@@ -1303,21 +940,21 @@ class MultitaskSeldAudioFrameCartDcaseDwaCriterion(
             "weights0": weights0,
             "weights1": weights1,
         }
+
         if self.report_accuracy and not self.training:
             with torch.no_grad():
-                class_logits = net_output["class_encoder_out"].float()
+                class_logits = net_output["class_encoder_out"].float()  # (B, T, N)
                 reg_logits = net_output["regression_out"].float()
-
-                class_labels = sample["sed_labels"].float()
-                reg_targets = sample["doa_labels"].float()
+                class_labels = sample["sed_labels"].to(class_logits)  # (B, T, N)
+                reg_targets = sample["doa_labels"].to(reg_logits)  # (B, T, 3N)
 
                 class_probs = torch.sigmoid(class_logits)
 
-                class_probs = class_probs.cpu().numpy()
-                class_labels = class_labels.cpu().numpy()
+                class_probs = torch_to_numpy(class_probs)
+                class_labels = torch_to_numpy(class_labels)
 
-                reg_logits = reg_logits.cpu().numpy()
-                reg_targets = reg_targets.cpu().numpy()
+                reg_logits = torch_to_numpy(reg_logits)
+                reg_targets = torch_to_numpy(reg_targets)
 
                 class_probs = reshape_3Dto2D(class_probs)
                 class_labels = reshape_3Dto2D(class_labels)
@@ -1369,37 +1006,35 @@ class MultitaskSeldAudioFrameCartDcaseGradNormCriterion(
         nb_classes=11,
         loss_weights=(1, 1),
         doa_size=3,
-        use_labels_mask=True,
+        use_labels_mask=1.0,
         extend_mask=True,
-        constrain_r_unit=False,
-        focal_loss=False,
-        focal_alpha=0.25,
-        focal_gamma=2.0,
-        focal_bw=False,
+        class_type="CE",
+        gamma=2.0,
+        clip=0,
         regr_type="mse",
         grad_norm_alpha=0.12,
+        grad_norm_scale=2.0,
         grad_norm_x_range=[-3, 3],
         num_updates=320000,
         skip_grad_norm_for_n_updates=0,
     ):
         super().__init__(
-            task,
-            sentence_avg,
-            report_accuracy,
-            nb_classes,
-            loss_weights,
-            doa_size,
-            use_labels_mask,
-            extend_mask,
-            constrain_r_unit,
-            focal_loss,
-            focal_alpha,
-            focal_gamma,
-            focal_bw,
-            regr_type,
+            task=task,
+            sentence_avg=sentence_avg,
+            report_accuracy=report_accuracy,
+            nb_classes=nb_classes,
+            loss_weights=loss_weights,
+            doa_size=doa_size,
+            use_labels_mask=use_labels_mask,
+            extend_mask=extend_mask,
+            class_type=class_type,
+            gamma=gamma,
+            clip=clip,
+            regr_type=regr_type,
         )
 
         self.alpha = grad_norm_alpha
+        self.grad_scale = grad_norm_scale
         self.initial_task_loss = None
         self.skip_grad_norm_for_n_updates = skip_grad_norm_for_n_updates
 
@@ -1419,7 +1054,7 @@ class MultitaskSeldAudioFrameCartDcaseGradNormCriterion(
 
         if self.initial_task_loss is None:
             # set L(0)
-            self.initial_task_loss = task_loss.data.cpu().numpy()
+            self.initial_task_loss = torch_to_numpy(task_loss.data)
 
         # get the total loss
         loss = torch.sum(weighted_task_loss)
@@ -1455,12 +1090,12 @@ class MultitaskSeldAudioFrameCartDcaseGradNormCriterion(
 
         # compute the inverse training rate r_i(t)
         # \curl{L}_i
-        loss_ratio = task_loss.data.cpu().numpy() / self.initial_task_loss
+        loss_ratio = torch_to_numpy(task_loss.data) / self.initial_task_loss
         # r_i(t)
         inverse_train_rate = loss_ratio / np.mean(loss_ratio)
 
         # compute the mean norm \tilde{G}_w(t)
-        mean_norm = np.mean(norms.data.cpu().numpy())
+        mean_norm = np.mean(torch_to_numpy(norms.data))
 
         # compute the GradNorm loss
         # this term has to remain constant
@@ -1472,9 +1107,9 @@ class MultitaskSeldAudioFrameCartDcaseGradNormCriterion(
         grad_norm_loss = torch.sum(torch.abs(norms - constant_term))
 
         # compute the gradient for the weights
-        model.w2v_encoder.weights.grad = torch.autograd.grad(grad_norm_loss,
-                                                             model.w2v_encoder.weights,
-                                                             retain_graph=True)[0]
+        model.w2v_encoder.weights.grad = torch.autograd.grad(
+            grad_norm_loss, model.w2v_encoder.weights, retain_graph=True
+        )[0]
 
         return grad_norm_loss
 
@@ -1487,11 +1122,10 @@ class MultitaskSeldAudioFrameCartDcaseGradNormCriterion(
         3) logging outputs to display while training
         """
 
-        net_output = model(**sample["net_input"])
-
-        # renormalize
-        # normalize_coeff = 2.0 / torch.sum(model.w2v_encoder.weights.data, dim=0)
-        # model.w2v_encoder.weights.data = model.w2v_encoder.weights.data * normalize_coeff
+        if self.training or self.task.cfg.segment_eval:
+            net_output = model(**sample["net_input"])
+        else:
+            net_output, sample = self.task.inference_step(sample, model)
 
         current_step = model.w2v_encoder.num_updates
 
@@ -1508,7 +1142,10 @@ class MultitaskSeldAudioFrameCartDcaseGradNormCriterion(
                 model.w2v_encoder.weights.device
             )
         else:
-            model.w2v_encoder.weights.data = 2 * F.softmax(model.w2v_encoder.weights.data, dim=-1)
+            # renormalize
+            model.w2v_encoder.weights.data = self.grad_scale * F.softmax(
+                model.w2v_encoder.weights.data, dim=-1
+            )
 
         if isinstance(self.alpha, float):
             alpha = self.alpha
@@ -1519,22 +1156,23 @@ class MultitaskSeldAudioFrameCartDcaseGradNormCriterion(
 
         weights = model.w2v_encoder.weights.data.cpu()
 
-        assert np.isclose(sum(weights), 2.0, atol=1e-3), f"{sum(weights)} != 2.0"
+        assert np.isclose(sum(weights), self.grad_scale, atol=1e-3), (
+            f"{sum(weights)} != 2.0"
+        )
         weights0, weights1 = weights[0], weights[1]
 
         metrics.log_scalar("weights0", weights0, weight=0, round=3, priority=10000)
         metrics.log_scalar("weights1", weights1, weight=0, round=3, priority=10000)
 
         # evaluate each task loss L_i(t)
-        with torch.cuda.amp.autocast(dtype=torch.float32):
-            loss, multi_label_loss, reg_loss = self.compute_loss(
-                net_output, sample, reduce=reduce
-            )
-            task_loss = torch.stack([multi_label_loss, reg_loss])
-            if self.training:
-                grad_norm_loss = self.compute_grad_norm(task_loss, model, alpha=alpha)
-            else:
-                grad_norm_loss = torch.tensor(0).to(loss.device)
+        loss, multi_label_loss, reg_loss = self.compute_loss(
+            net_output, sample, reduce=reduce
+        )
+        task_loss = torch.stack([multi_label_loss, reg_loss])
+        if self.training:
+            grad_norm_loss = self.compute_grad_norm(task_loss, model, alpha=alpha)
+        else:
+            grad_norm_loss = torch.tensor(0).to(loss.device)
 
         sample_size = (
             sample["sed_labels"].size(0) if self.sentence_avg else sample["ntokens"]
@@ -1551,19 +1189,18 @@ class MultitaskSeldAudioFrameCartDcaseGradNormCriterion(
         }
         if self.report_accuracy and not self.training:
             with torch.no_grad():
-                class_logits = net_output["class_encoder_out"].float()
+                class_logits = net_output["class_encoder_out"].float()  # (B, T, N)
                 reg_logits = net_output["regression_out"].float()
-
-                class_labels = sample["sed_labels"].float()
-                reg_targets = sample["doa_labels"].float()
+                class_labels = sample["sed_labels"].float()  # (B, T, N)
+                reg_targets = sample["doa_labels"].float()  # (B, T, 3N)
 
                 class_probs = torch.sigmoid(class_logits)
 
-                class_probs = class_probs.cpu().numpy()
-                class_labels = class_labels.cpu().numpy()
+                class_probs = torch_to_numpy(class_probs)
+                class_labels = torch_to_numpy(class_labels)
 
-                reg_logits = reg_logits.cpu().numpy()
-                reg_targets = reg_targets.cpu().numpy()
+                reg_logits = torch_to_numpy(reg_logits)
+                reg_targets = torch_to_numpy(reg_targets)
 
                 class_probs = reshape_3Dto2D(class_probs)
                 class_labels = reshape_3Dto2D(class_labels)
@@ -1608,3 +1245,406 @@ class MultitaskSeldAudioFrameCartDcaseGradNormCriterion(
         metrics.log_scalar(
             "grad_norm_loss", grad_norm_loss / ntokens / math.log(2), ntokens, round=5
         )
+
+
+@register_criterion(
+    "multitask_frame_cart_dcase_discretizer",
+    dataclass=MultitaskSeldCriterionDiscConfig,
+)
+class MultitaskSeldAudioFrameCartDiscretizerCriterion(
+    MultitaskSeldAudioFrameCartDcaseCriterion
+):
+    def __init__(
+        self,
+        task,
+        sentence_avg,
+        report_accuracy=True,
+        nb_classes=11,
+        loss_weights=(1, 1),
+        doa_size=3,
+        use_labels_mask=1.0,
+        extend_mask=True,
+        class_type="CE",
+        gamma=2.0,
+        clip=0,
+        regr_type="mse",
+        balance_doa_classes=False,
+    ):
+        super().__init__(
+            task=task,
+            sentence_avg=sentence_avg,
+            report_accuracy=report_accuracy,
+            nb_classes=nb_classes,
+            loss_weights=loss_weights,
+            doa_size=doa_size,
+            use_labels_mask=use_labels_mask,
+            extend_mask=extend_mask,
+            class_type=class_type,
+            gamma=gamma,
+            clip=clip,
+            regr_type=regr_type,
+        )
+
+        assert self.task.cfg.doa_discretizer.flag
+
+        self.n_bins = self.task.cfg.doa_discretizer.n_bins
+        self.balance_doa_classes = balance_doa_classes
+
+    def compute_metrics(self, preds, targets, labels):
+        cm = confusion_matrix(targets, preds, labels)
+
+        TP = np.diag(cm)  # Diagonal elements are the True Positives
+        FP = cm.sum(axis=0) - TP  # Column-wise sum minus TP
+        FN = cm.sum(axis=1) - TP  # Row-wise sum minus TP
+        TN = cm.sum() - (FP + FN + TP)  # Total sum minus FP, FN, TP
+        return TP, TN, FP, FN
+
+    def get_class_mask(self, class_logits, class_labels, thr=0.5):
+        if self.training:
+            if self.class_mask_type():
+                class_mask = class_labels > thr
+            else:
+                class_mask = torch.sigmoid(class_logits) > thr
+        else:
+            # inference-time
+            class_mask = torch.sigmoid(class_logits) > thr
+        return class_mask
+
+    def compute_loss(self, net_output, sample, reduce=True):
+        class_logits = net_output["class_encoder_out"].float()  # (B, T, N)
+        reg_logits = net_output["regression_out"].float()  # (B, T, N, 3, BINS)
+        class_labels = sample["sed_labels"].to(class_logits)  # (B, T, N)
+        reg_targets = sample["doa_labels"].to(reg_logits)  # (B, T, 3N)
+
+        class_mask = self.get_class_mask(
+            class_logits, class_labels, thr=self.task.best_threshold
+        )
+
+        # ignore padded labels -100
+        class_pad_mask = class_labels < 0
+        class_labels[class_pad_mask] = torch.tensor(0.0).to(class_labels)
+
+        multi_label_loss = self.class_loss(class_logits, class_labels)
+
+        B, T, N = class_labels.shape
+        reg_targets_3d = reg_targets.reshape((B, T, self.doa_size, N)).transpose(
+            3, 2
+        )  # (B, T, N, 3)
+
+        doa_logits = reg_logits[class_mask]  # (E, 3, BINS)
+        doa_logits = doa_logits.transpose(1, 2)  # (E, BINS, 3)
+        reg_targets_mask = torch_to_numpy(reg_targets_3d[class_mask])
+
+        doa_labels = self.task.doa_discretizer_tf.transform(
+            reg_targets_mask.reshape(-1, 1)
+        )
+        doa_labels = doa_labels.reshape(reg_targets_mask.shape)
+        doa_labels = torch.from_numpy(doa_labels).to(reg_targets).long()  # (E, 3)
+
+        if self.balance_doa_classes:
+            doa_class_weights = compute_class_weight_labels(
+                labels=torch_to_numpy(doa_labels).reshape(-1), num_classes=self.n_bins
+            )
+            doa_class_weights = torch.tensor(doa_class_weights).to(doa_logits)
+            doa_class_weights = doa_class_weights / sum(
+                doa_class_weights
+            )  # sum up to 1
+
+            reg_loss = F.cross_entropy(
+                doa_logits, doa_labels, weight=doa_class_weights, reduction="sum"
+            )
+        else:
+            reg_loss = F.cross_entropy(doa_logits, doa_labels, reduction="sum")
+
+        loss = self.loss_weights[0] * multi_label_loss + self.loss_weights[1] * reg_loss
+
+        return loss, multi_label_loss, reg_loss
+
+    def forward(self, model, sample, reduce=True):
+        """Compute the loss for the given sample.
+
+        Returns a tuple with three elements:
+        1) the loss
+        2) the sample size, which is used as the denominator for the gradient
+        3) logging outputs to display while training
+        """
+        loss, sample_size, logging_output, net_output = self.step_forward_model(
+            model, sample, reduce
+        )
+
+        logging_output = self.log_output(
+            sample=sample, net_output=net_output, logging_output=logging_output
+        )
+
+        return loss, sample_size, logging_output
+
+    def log_output(self, sample, net_output, logging_output):
+        if self.report_accuracy and not self.training:
+            with torch.no_grad():
+                class_logits = net_output["class_encoder_out"].float()  # (B, T, N)
+                reg_logits = net_output["regression_out"].float()  # (B, T, N, 3, BINS)
+                class_labels = sample["sed_labels"].to(class_logits)  # (B, T, N)
+                reg_targets = sample["doa_labels"].to(reg_logits)  # (B, T, 3N)
+
+                class_probs = torch.sigmoid(class_logits.float())
+
+                class_mask = class_probs > self.task.best_threshold
+                # class_mask = class_labels > self.task.best_threshold
+
+                # check if any event is detected
+                if class_mask.any().item():
+                    B, T, N = class_labels.shape
+                    reg_targets_3d = reg_targets.reshape(
+                        (B, T, self.doa_size, N)
+                    ).transpose(3, 2)  # (B, T, N, 3)
+
+                    doa_logits = reg_logits[class_mask]  # (E, 3)
+                    reg_targets_mask = torch_to_numpy(
+                        reg_targets_3d[class_mask]
+                    )  # (E, 3)
+                    doa_labels = self.task.doa_discretizer_tf.transform(
+                        reg_targets_mask.reshape(-1, 1)
+                    )  # (E*3,)
+                    doa_labels = doa_labels.reshape(reg_targets_mask.shape)
+
+                    doa_preds = torch_to_numpy(
+                        F.softmax(doa_logits, dim=-1).argmax(-1)
+                    )  # (E, 3)
+                    # doa_preds = doa_labels.copy() # (E, 3)
+
+                    reg_logits_mask = self.task.doa_discretizer_tf.inverse_transform(
+                        doa_preds.reshape(-1, 1)
+                    )  # (E*3,)
+
+                    class_mask = torch_to_numpy(class_mask)
+                    class_labels = torch_to_numpy(class_labels)
+                    reg_targets = torch_to_numpy(reg_targets).astype(np.float32)
+                    class_probs = torch_to_numpy(class_probs).astype(np.float32)
+
+                    reg_logits_preds = np.zeros(reg_targets_3d.shape).astype(
+                        np.float32
+                    )  # (B, T, N, 3)
+                    reg_logits_preds[class_mask] = reg_logits_mask.reshape(
+                        doa_preds.shape
+                    )
+                    reg_logits_preds = reg_logits_preds.transpose((0, 1, 3, 2)).reshape(
+                        (B, T, 3 * N)
+                    )
+                    reg_logits_preds = reg_logits_preds.astype(np.float32)  # (B, T, 3N)
+
+                    TP, TN, FP, FN = self.compute_metrics(
+                        preds=doa_preds.reshape(-1),
+                        targets=doa_labels.reshape(-1),
+                        labels=np.arange(self.n_bins).tolist(),
+                    )
+                    n_correct = np.sum(TP) + np.sum(TN)
+                    total = n_correct + np.sum(FP) + np.sum(FN)
+
+                    class_probs = reshape_3Dto2D(class_probs)
+                    class_labels = reshape_3Dto2D(class_labels)
+                    reg_logits = reshape_3Dto2D(reg_logits_preds)
+                    reg_targets = reshape_3Dto2D(reg_targets)
+
+                    logging_output["class_probs"] = class_probs
+                    logging_output["class_labels"] = class_labels
+                    logging_output["reg_logits"] = reg_logits
+                    logging_output["reg_targets"] = reg_targets
+
+                    logging_output["doa_n_correct"] = n_correct
+                    logging_output["doa_total"] = total
+
+                    logging_output["doa_TP"] = TP
+                    logging_output["doa_TN"] = TN
+                    logging_output["doa_FP"] = FP
+                    logging_output["doa_FN"] = FN
+                else:
+                    # if no event is detected we set tp, tn, fp, fn to zero and regreession logits
+                    logging_output["reg_logits"] = np.zeros(reg_targets.shape)
+
+                    logging_output["doa_n_correct"] = 0
+                    logging_output["doa_total"] = 0
+
+                    logging_output["doa_TP"] = 0
+                    logging_output["doa_TN"] = 0
+                    logging_output["doa_FP"] = 0
+                    logging_output["doa_FN"] = 0
+        return logging_output
+
+    @classmethod
+    def reduce_metrics(cls, logging_outputs) -> None:
+        """Aggregate logging outputs from data parallel training."""
+        super().reduce_metrics(logging_outputs)
+
+        total = utils.item(sum(log.get("doa_total", 0) for log in logging_outputs))
+        if total > 0:
+            metrics.log_scalar("doa_total", total)
+            n_correct = utils.item(
+                sum(log.get("doa_n_correct", 0) for log in logging_outputs)
+            )
+            metrics.log_scalar("doa_n_correct", n_correct)
+            metrics.log_derived(
+                "doa_accuracy",
+                lambda meters: round(
+                    meters["doa_n_correct"].sum * 100.0 / meters["doa_total"].sum, 3
+                )
+                if meters["doa_total"].sum > 0
+                else float("nan"),
+            )
+
+            tp = np.sum([log.get("doa_TP", 0) for log in logging_outputs], axis=0)
+            fp = np.sum([log.get("doa_FP", 0) for log in logging_outputs], axis=0)
+            fn = np.sum([log.get("doa_FN", 0) for log in logging_outputs], axis=0)
+
+            f1 = (2 * tp + eps) / (2 * tp + fp + fn + eps)
+
+            f1_value = np.mean(f1)
+            if not np.isnan(f1_value):
+                metrics.log_scalar("doa_f1_score", f1_value * 100.0)
+
+
+@register_criterion(
+    "multitask_frame_cart_dcase_discretizer_gn",
+    dataclass=MultitaskSeldCriterionDiscGradNormConfig,
+)
+class MultitaskSeldAudioFrameCartDiscretizerGradNormCriterion(
+    MultitaskSeldAudioFrameCartDiscretizerCriterion,
+    MultitaskSeldAudioFrameCartDcaseGradNormCriterion,
+):
+    def __init__(
+        self,
+        task,
+        sentence_avg,
+        report_accuracy=True,
+        nb_classes=11,
+        loss_weights=(1, 1),
+        doa_size=3,
+        use_labels_mask=1.0,
+        extend_mask=True,
+        class_type="CE",
+        gamma=2.0,
+        clip=0,
+        regr_type="mse",
+        balance_doa_classes=False,
+        grad_norm_alpha=0.12,
+        grad_norm_scale=2.0,
+        grad_norm_x_range=[-3, 3],
+        num_updates=320000,
+        skip_grad_norm_for_n_updates=0,
+    ):
+        MultitaskSeldAudioFrameCartDiscretizerCriterion.__init__(
+            self,
+            task=task,
+            sentence_avg=sentence_avg,
+            report_accuracy=report_accuracy,
+            nb_classes=nb_classes,
+            loss_weights=loss_weights,
+            doa_size=doa_size,
+            use_labels_mask=use_labels_mask,
+            extend_mask=extend_mask,
+            class_type=class_type,
+            gamma=gamma,
+            clip=clip,
+            regr_type=regr_type,
+            balance_doa_classes=balance_doa_classes,
+        )
+
+        MultitaskSeldAudioFrameCartDcaseGradNormCriterion.__init__(
+            self,
+            task=task,
+            sentence_avg=sentence_avg,
+            report_accuracy=report_accuracy,
+            nb_classes=nb_classes,
+            loss_weights=loss_weights,
+            doa_size=doa_size,
+            use_labels_mask=use_labels_mask,
+            extend_mask=extend_mask,
+            class_type=class_type,
+            gamma=gamma,
+            clip=clip,
+            regr_type=regr_type,
+            grad_norm_alpha=grad_norm_alpha,
+            grad_norm_scale=grad_norm_scale,
+            grad_norm_x_range=grad_norm_x_range,
+            num_updates=num_updates,
+            skip_grad_norm_for_n_updates=skip_grad_norm_for_n_updates,
+        )
+
+    def forward(self, model, sample, reduce=True):
+        """Compute the loss for the given sample.
+
+        Returns a tuple with three elements:
+        1) the loss
+        2) the sample size, which is used as the denominator for the gradient
+        3) logging outputs to display while training
+        """
+
+        if self.training or self.task.cfg.segment_eval:
+            net_output = model(**sample["net_input"])
+        else:
+            net_output, sample = self.task.inference_step(sample, model)
+
+        current_step = model.w2v_encoder.num_updates
+
+        if (
+            current_step <= model.w2v_encoder.freeze_finetune_updates
+            or current_step <= self.skip_grad_norm_for_n_updates
+        ):
+            self.skip_grad_norm = True
+        else:
+            self.skip_grad_norm = False
+
+        if self.skip_grad_norm:
+            model.w2v_encoder.weights.data = torch.tensor(self.loss_weights).to(
+                model.w2v_encoder.weights.device
+            )
+        else:
+            model.w2v_encoder.weights.data = self.grad_scale * F.softmax(
+                model.w2v_encoder.weights.data, dim=-1
+            )
+
+        if isinstance(self.alpha, float):
+            alpha = self.alpha
+        else:
+            alpha = self.sigmoid_schedule(current_step)
+
+            metrics.log_scalar("alpha", alpha, weight=0, round=3, priority=10000)
+
+        weights = model.w2v_encoder.weights.data.cpu()
+
+        assert np.isclose(sum(weights), self.grad_scale, atol=1e-3), (
+            f"{sum(weights)} != 2.0"
+        )
+        weights0, weights1 = weights[0], weights[1]
+
+        metrics.log_scalar("weights0", weights0, weight=0, round=3, priority=10000)
+        metrics.log_scalar("weights1", weights1, weight=0, round=3, priority=10000)
+
+        # evaluate each task loss L_i(t)
+        loss, multi_label_loss, reg_loss = self.compute_loss(
+            net_output, sample, reduce=reduce
+        )
+        task_loss = torch.stack([multi_label_loss, reg_loss])
+        if self.training:
+            grad_norm_loss = self.compute_grad_norm(task_loss, model, alpha=alpha)
+        else:
+            grad_norm_loss = torch.tensor(0).to(loss.device)
+
+        sample_size = (
+            sample["sed_labels"].size(0) if self.sentence_avg else sample["ntokens"]
+        )
+
+        logging_output = {
+            "loss": loss.data,
+            "multi_label_loss": multi_label_loss.data,
+            "reg_loss": reg_loss.data,
+            "grad_norm_loss": grad_norm_loss.data,
+            "ntokens": sample["ntokens"],
+            "nsentences": sample["sed_labels"].size(0),
+            "sample_size": sample_size,
+        }
+
+        logging_output = self.log_output(
+            sample=sample, net_output=net_output, logging_output=logging_output
+        )
+
+        return grad_norm_loss, sample_size, logging_output
