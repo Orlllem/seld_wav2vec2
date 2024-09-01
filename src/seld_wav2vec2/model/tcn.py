@@ -307,17 +307,14 @@ class TemporalResnetBlock(nn.Module):
         dropout=0.2,
         mode="default",
         activation_fn="gelu",
+        bias=True
     ):
         super().__init__()
 
         if mode == "layer_norm":
             conv1 = nn.Sequential(
                 conv.TemporalConv1d(
-                    n_inputs,
-                    n_outputs,
-                    kernel_size,
-                    stride=1,
-                    dilation=1,
+                    n_inputs, n_outputs, kernel_size, stride=1, dilation=1, bias=bias
                 ),
                 TransposeLast(),
                 Fp32LayerNorm(n_outputs, elementwise_affine=True),
@@ -326,11 +323,7 @@ class TemporalResnetBlock(nn.Module):
         else:
             conv1 = weight_norm(
                 conv.TemporalConv1d(
-                    n_inputs,
-                    n_outputs,
-                    kernel_size,
-                    stride=1,
-                    dilation=1,
+                    n_inputs, n_outputs, kernel_size, stride=1, dilation=1, bias=bias
                 )
             )
         act1 = get_activation_fn(activation_fn)
