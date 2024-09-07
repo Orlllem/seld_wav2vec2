@@ -1,31 +1,38 @@
-
-
 import random
 import warnings
 from typing import Optional
 
 import numpy as np
 import torch
+import torch.nn as nn
+from cseld_ambisonics import mono_to_foa_dynamic
 from torch import Tensor
-from torch_audiomentations import Shift
+from torch_audiomentations import AddColoredNoise, Shift
+from torch_audiomentations.augmentations.colored_noise import _gen_noise
 from torch_audiomentations.augmentations.shift import shift_cpu, shift_gpu
 from torch_audiomentations.core.transforms_interface import (
     MultichannelAudioNotSupportedException,
 )
+from torch_audiomentations.utils.dsp import calculate_rms
 from torch_audiomentations.utils.multichannel import is_multichannel
 from torch_audiomentations.utils.object_dict import ObjectDict
 from torchaudio import functional as F
 
+from seld_wav2vec2.data.utils import (
+    CONV_FEATURE_LAYERS,
+    get_feat_extract_output_lengths,
+)
+
 
 def sph2cart(azimuth, elevation, r):
-    '''
+    """
     Convert spherical to cartesian coordinates
 
     :param azimuth: in radians
     :param elevation: in radians
     :param r: in meters
     :return: cartesian coordinates
-    '''
+    """
 
     x = r * torch.cos(elevation) * torch.cos(azimuth)
     y = r * torch.cos(elevation) * torch.sin(azimuth)
@@ -34,14 +41,14 @@ def sph2cart(azimuth, elevation, r):
 
 
 def cart2sph(x, y, z):
-    '''
+    """
     Convert cartesian to spherical coordinates
 
     :param x:
     :param y:
     :param z:
     :return: azi, ele in radians and r in meters
-    '''
+    """
 
     azimuth = torch.arctan2(y, x)
     elevation = torch.arctan2(z, torch.sqrt(x**2 + y**2))
@@ -49,20 +56,20 @@ def cart2sph(x, y, z):
     return azimuth, elevation, r
 
 
-def select_shift_tf(p: float = 0.5, rollover: bool = False, in_channels: int = 4):
-
-    if in_channels == 4:
-        shift_tf = RandomSeqShift(p=p, rollover=rollover)
-    else:
+def select_shift_tf(
+    p: float = 0.5, rollover: bool = False, spectrogram_input: bool = False
+):
+    if spectrogram_input:
         shift_tf = SpecShift(p=p, rollover=rollover)
-
+    else:
+        shift_tf = RandomSeqShift(p=p, rollover=rollover)
     return shift_tf
 
 
 def convert_spec2d_to_spec1d(spec):
     # spec (7, 64, T)
     C, N, T = spec.shape
-    spec1d = spec.reshape(C*N, T)
+    spec1d = spec.reshape(C * N, T)
     return spec1d  # spec (448, T)
 
 
@@ -73,7 +80,7 @@ def convert_spec1d_to_spec2d(spec):
     return spec2d  # (7, 64, T)
 
 
-class RandomSwapChannel(object):
+class RandomSwapChannel(nn.Module):
     """
     The data augmentation random swap xyz channel of tfmap of FOA format.
     Adaptation of SALSA (TfmapRandomSwapChannelFoa) to work with torch and raw audio.
@@ -81,11 +88,11 @@ class RandomSwapChannel(object):
     """
 
     def __init__(self, p: float = 0.5, n_classes: int = 11):
+        super().__init__()
         self.p = p
         self.n_classes = n_classes
 
-    def __call__(self, x: torch.Tensor, y_sed: torch.Tensor, y_doa: torch.Tensor):
-
+    def forward(self, x: torch.Tensor, y_sed: torch.Tensor, y_doa: torch.Tensor):
         x_new = x.clone()
         y_sed_new = y_sed.clone()
         y_doa_new = y_doa.clone()
@@ -100,27 +107,26 @@ class RandomSwapChannel(object):
         return x_new, y_sed_new, y_doa_new
 
     def apply_doa_tf(self, doa_labels, tf):
-
-        x = doa_labels[:, :self.n_classes]
-        y = doa_labels[:, self.n_classes:2*self.n_classes]
-        z = doa_labels[:, 2*self.n_classes:]
+        x = doa_labels[:, : self.n_classes]
+        y = doa_labels[:, self.n_classes: 2 * self.n_classes]
+        z = doa_labels[:, 2 * self.n_classes:]
 
         azi, ele, r = cart2sph(x, y, z)
 
         if tf == 0:  # azi=-azi-pi/2, ele=ele
-            x_new, y_new, z_new = sph2cart(-azi-np.pi/2, ele, r=1)
+            x_new, y_new, z_new = sph2cart(-azi - np.pi / 2, ele, r=1)
         elif tf == 1:  # azi=-azi+pi/2, ele=ele
-            x_new, y_new, z_new = sph2cart(-azi+np.pi/2, ele, r=1)
+            x_new, y_new, z_new = sph2cart(-azi + np.pi / 2, ele, r=1)
         elif tf == 2:  # azi=azi+pi, ele=ele
-            x_new, y_new, z_new = sph2cart(azi+np.pi, ele, r=1)
+            x_new, y_new, z_new = sph2cart(azi + np.pi, ele, r=1)
         elif tf == 3:  # azi=azi-pi/2, ele=-ele
-            x_new, y_new, z_new = sph2cart(azi-np.pi/2, -ele, r=1)
+            x_new, y_new, z_new = sph2cart(azi - np.pi / 2, -ele, r=1)
         elif tf == 4:  # azi=azi+pi/2, ele=-ele
-            x_new, y_new, z_new = sph2cart(azi+np.pi/2, -ele, r=1)
+            x_new, y_new, z_new = sph2cart(azi + np.pi / 2, -ele, r=1)
         elif tf == 5:  # azi=-azi, ele=-ele
             x_new, y_new, z_new = sph2cart(-azi, -ele, r=1)
         elif tf == 6:  # azi=-azi+pi, ele=-ele
-            x_new, y_new, z_new = sph2cart(-azi+np.pi, -ele, r=1)
+            x_new, y_new, z_new = sph2cart(-azi + np.pi, -ele, r=1)
         else:
             print("only six types of transform are available")
 
@@ -130,17 +136,20 @@ class RandomSwapChannel(object):
 
     def apply_doa_tf_spec(self, y_doa_new, m):
         if m[0] == 1:
-            y_doa_new[:, 0:self.n_classes] = y_doa_new[:,
-                                                       self.n_classes:2*self.n_classes]
-            y_doa_new[:, self.n_classes:2 *
-                      self.n_classes] = y_doa_new[:, :self.n_classes]
+            y_doa_new[:, 0: self.n_classes] = y_doa_new[
+                :, self.n_classes: 2 * self.n_classes
+            ]
+            y_doa_new[:, self.n_classes: 2 * self.n_classes] = y_doa_new[
+                :, : self.n_classes
+            ]
         if m[1] == 1:
-            y_doa_new[:, 0:self.n_classes] = - y_doa_new[:, 0:self.n_classes]
+            y_doa_new[:, 0: self.n_classes] = -y_doa_new[:, 0: self.n_classes]
         if m[2] == 1:
-            y_doa_new[:, self.n_classes: 2*self.n_classes] = - \
-                y_doa_new[:, self.n_classes: 2*self.n_classes]
+            y_doa_new[:, self.n_classes: 2 * self.n_classes] = -y_doa_new[
+                :, self.n_classes: 2 * self.n_classes
+            ]
         if m[3] == 1:
-            y_doa_new[:, 2*self.n_classes:] = - y_doa_new[:, 2*self.n_classes:]
+            y_doa_new[:, 2 * self.n_classes:] = -y_doa_new[:, 2 * self.n_classes:]
         return y_doa_new
 
     def apply(self, x: torch.Tensor, y_sed: torch.Tensor, y_doa: torch.Tensor):
@@ -164,7 +173,7 @@ class RandomSwapChannel(object):
 
         if n_input_channels == 4:
             # random method
-            m = np.random.randint(7)  # six type of transformations
+            m = np.random.randint(7)  # seven type of transformations
             # change input feature
             if m == 0:  # (C1, -C4, C3, -C2)
                 x_new[1], x_new[3] = x[3], -x[1]
@@ -184,7 +193,6 @@ class RandomSwapChannel(object):
                 print("only seven types of transform are available")
 
         elif n_input_channels == 7:
-
             # input -> W Y Z X X Y Z: 7 channels
             # random method
             m = np.random.randint(2, size=(4,))
@@ -202,8 +210,7 @@ class RandomSwapChannel(object):
                 x_new[-1] = -x_new[-1]
 
         else:
-
-            n_mels = int(n_input_channels/7)
+            n_mels = int(n_input_channels / 7)
 
             # random method
             m = np.random.randint(2, size=(4,))
@@ -228,21 +235,9 @@ class RandomSwapChannel(object):
             else:
                 y_doa_new = self.apply_doa_tf_spec(y_doa_new, m)
         else:
-            raise NotImplementedError(
-                'only cartesian output format is implemented')
+            raise NotImplementedError("only cartesian output format is implemented")
 
         return x_new, y_sed, y_doa_new
-
-
-class Compose(object):
-    def __init__(self, list_tfs):
-        self.list_tfs = list_tfs
-
-    def __call__(self, x: torch.Tensor, y_sed: torch.Tensor, y_doa: torch.Tensor):
-
-        for tf in self.list_tfs:
-            x, y_sed, y_doa = tf(x, y_sed, y_doa)
-        return x, y_sed, y_doa
 
 
 class RandomSeqShift(object):
@@ -253,33 +248,40 @@ class RandomSeqShift(object):
 
     def __init__(self, p: float = 0.5, rollover=False, sample_rate=16000):
         self.shift_tf = SeqShift(
-            p=p, rollover=rollover, sample_rate=sample_rate, output_type=dict)
+            p=p, rollover=rollover, sample_rate=sample_rate, output_type=dict
+        )
 
     def __call__(self, x: torch.Tensor, y_sed: torch.Tensor, y_doa: torch.Tensor):
-        shifted_dict = self.shift_tf(x,
-                                     targets=y_sed,
-                                     doa_targets=y_doa,
-                                     target_rate=50)
+        shifted_dict = self.shift_tf(
+            x, targets=y_sed, doa_targets=y_doa, target_rate=50
+        )
 
-        return shifted_dict["samples"], shifted_dict["targets"], shifted_dict["doa_targets"]
+        return (
+            shifted_dict["samples"],
+            shifted_dict["targets"],
+            shifted_dict["doa_targets"],
+        )
 
 
-class SpecShift(object):
+class SpecShift(nn.Module):
     """
     The data augmentation random shift of tfmap of spectrogram.
     """
 
-    def __init__(self, p: float = 0.5,
-                 rollover: bool = True,
-                 min_shift: int = -74,
-                 max_shift: int = 74):
+    def __init__(
+        self,
+        p: float = 0.5,
+        rollover: bool = True,
+        min_shift: int = -74,
+        max_shift: int = 74,
+    ):
+        super().__init__()
         self.p = p
         self.rollover = rollover
         self.min_shift = min_shift
         self.max_shift = max_shift
 
-    def __call__(self, x: torch.Tensor, y_sed: torch.Tensor, y_doa: torch.Tensor):
-
+    def forward(self, x: torch.Tensor, y_sed: torch.Tensor, y_doa: torch.Tensor):
         x_new = x.clone()
         y_sed_new = y_sed.clone()
         y_doa_new = y_doa.clone()
@@ -297,16 +299,9 @@ class SpecShift(object):
         return x_new, y_sed_new, y_doa_new
 
     def apply(self, spec, sed_label, doa_label, num_samples_to_shift):
-
-        spec = torch.roll(
-            spec, shifts=num_samples_to_shift, dims=-1
-        )
-        sed_label = torch.roll(
-            sed_label, shifts=num_samples_to_shift, dims=0
-        )
-        doa_label = torch.roll(
-            doa_label, shifts=num_samples_to_shift, dims=0
-        )
+        spec = torch.roll(spec, shifts=num_samples_to_shift, dims=-1)
+        sed_label = torch.roll(sed_label, shifts=num_samples_to_shift, dims=0)
+        doa_label = torch.roll(doa_label, shifts=num_samples_to_shift, dims=0)
 
         if not self.rollover:
             if num_samples_to_shift > 0:
@@ -326,7 +321,6 @@ class SeqShift(Shift):
         doa_targets: Optional[Tensor] = None,
         target_rate: Optional[int] = None,
     ) -> ObjectDict:
-
         if not self.training:
             output = ObjectDict(
                 samples=samples,
@@ -349,7 +343,8 @@ class SeqShift(Shift):
         if batch_size * num_channels * num_samples == 0:
             warnings.warn(
                 "An empty samples tensor was passed to {}".format(
-                    self.__class__.__name__)
+                    self.__class__.__name__
+                )
             )
             output = ObjectDict(
                 samples=samples,
@@ -386,10 +381,10 @@ class SeqShift(Shift):
 
         if has_targets and not self.supports_target:
             warnings.warn(
-                f"Targets are not (yet) supported by {self.__class__.__name__}")
+                f"Targets are not (yet) supported by {self.__class__.__name__}"
+            )
 
         if has_targets:
-
             (
                 target_batch_size,
                 num_frames,
@@ -417,7 +412,6 @@ class SeqShift(Shift):
                     target_rate = 0
 
         if not self.are_parameters_frozen:
-
             if self.p_mode == "per_example":
                 p_sample_size = batch_size
 
@@ -437,11 +431,9 @@ class SeqShift(Shift):
             }
 
         if self.transform_parameters["should_apply"].any():
-
             cloned_samples = samples.clone()
 
             if has_targets:
-
                 cloned_targets = targets.clone()
                 cloned_doa_targets = doa_targets.clone()
             else:
@@ -450,7 +442,6 @@ class SeqShift(Shift):
                 selected_targets = None
 
             if self.p_mode == "per_example":
-
                 selected_samples = cloned_samples[
                     self.transform_parameters["should_apply"]
                 ]
@@ -464,7 +455,6 @@ class SeqShift(Shift):
                     ]
 
                 if self.mode == "per_example":
-
                     if not self.are_parameters_frozen:
                         self.randomize_parameters(
                             samples=selected_samples,
@@ -481,14 +471,14 @@ class SeqShift(Shift):
                         target_rate=target_rate,
                     )
 
-                    cloned_samples[
-                        self.transform_parameters["should_apply"]
-                    ] = perturbed.samples
+                    cloned_samples[self.transform_parameters["should_apply"]] = (
+                        perturbed.samples
+                    )
 
                     if has_targets:
-                        cloned_targets[
-                            self.transform_parameters["should_apply"]
-                        ] = perturbed.targets
+                        cloned_targets[self.transform_parameters["should_apply"]] = (
+                            perturbed.targets
+                        )
                         cloned_doa_targets[
                             self.transform_parameters["should_apply"]
                         ] = perturbed.doa_targets
@@ -525,7 +515,6 @@ class SeqShift(Shift):
         doa_targets: Optional[Tensor] = None,
         target_rate: Optional[int] = None,
     ) -> ObjectDict:
-
         num_samples_to_shift = self.transform_parameters["num_samples_to_shift"]
 
         # Select fastest implementation based on device
@@ -538,12 +527,15 @@ class SeqShift(Shift):
 
         else:
             num_frames_to_shift = torch.round(
-                target_rate * num_samples_to_shift / sample_rate).to(torch.int32)
+                target_rate * num_samples_to_shift / sample_rate
+            ).to(torch.int32)
             shifted_targets = shift(
-                targets.transpose(-2, -1), num_frames_to_shift, self.rollover).transpose(-2, -1)
+                targets.transpose(-2, -1), num_frames_to_shift, self.rollover
+            ).transpose(-2, -1)
 
             shifted_doa_targets = shift(
-                doa_targets.transpose(-2, -1), num_frames_to_shift, self.rollover).transpose(-2, -1)
+                doa_targets.transpose(-2, -1), num_frames_to_shift, self.rollover
+            ).transpose(-2, -1)
 
         return ObjectDict(
             samples=shifted_samples,
@@ -554,7 +546,79 @@ class SeqShift(Shift):
         )
 
 
-class SpecAugment(torch.nn.Module):
+class AddColoredNoiseFoa(AddColoredNoise):
+    """
+    Add colored noises to the FOA input audio.
+    """
+
+    def length_spectrogram(self, input_length):
+        input_length = torch.tensor(input_length)
+        output_length = get_feat_extract_output_lengths(
+            CONV_FEATURE_LAYERS, input_length
+        ).tolist()
+        return output_length
+
+    def apply_transform(
+        self,
+        samples: Tensor = None,
+        sample_rate: Optional[int] = None,
+        targets: Optional[Tensor] = None,
+        target_rate: Optional[int] = None,
+    ) -> ObjectDict:
+        batch_size, num_channels, num_samples = samples.shape
+
+        # (batch_size, num_samples)
+        noise = torch.stack(
+            [
+                _gen_noise(
+                    self.transform_parameters["f_decay"][i],
+                    num_samples,
+                    sample_rate,
+                    samples.device,
+                )
+                for i in range(batch_size)
+            ]
+        )
+
+        noise_foa = []
+        for i in range(len(noise)):
+            sample_foa = mono_to_foa_dynamic(
+                x=noise[i].numpy(),
+                n_frames=self.length_spectrogram(num_samples) + 1,
+                sample_rate=sample_rate,
+                n_positions=random.choice([3, 4, 5, 6]),
+            )  # (T, C)
+            noise_foa.append(sample_foa)
+        noise_foa = torch.from_numpy(np.stack(noise_foa)).transpose(1, 2)  # (B, C, T)
+
+        # (batch_size, num_channels)
+        noise_rms = calculate_rms(samples) / (
+            10 ** (self.transform_parameters["snr_in_db"].unsqueeze(dim=-1) / 20)
+        )
+
+        noise_scaled = noise_rms.unsqueeze(-1) * noise_foa
+
+        if noise_scaled.shape[-1] < num_samples:
+            diff = num_samples - noise_scaled.shape[-1]
+            noise_scaled = torch.cat(
+                [
+                    noise_scaled,
+                    noise_scaled.new_full(
+                        (noise_scaled.shape[0], noise_scaled.shape[1], diff), 0.0
+                    ),
+                ],
+                dim=-1,
+            )
+
+        return ObjectDict(
+            samples=samples + noise_scaled,
+            sample_rate=sample_rate,
+            targets=targets,
+            target_rate=target_rate,
+        )
+
+
+class SpecAugment(nn.Module):
     r"""Apply time and frequency masking to a spectrogram.
     Args:
         n_time_masks (int): Number of time masks. If its value is zero, no time masking will be applied.
@@ -589,7 +653,7 @@ class SpecAugment(torch.nn.Module):
         p: float = 1.0,
         zero_masking: bool = False,
     ) -> None:
-        super(SpecAugment, self).__init__()
+        super().__init__()
         self.n_time_masks = n_time_masks
         self.time_mask_param = time_mask_param
         self.n_freq_masks = n_freq_masks
