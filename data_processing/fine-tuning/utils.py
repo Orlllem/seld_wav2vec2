@@ -7,6 +7,7 @@ import glob
 import logging
 import os
 
+import h5py
 import numpy as np
 import soundfile as sf
 import torch
@@ -65,7 +66,11 @@ def gen_tsv_manifest(save_folder, manifest_folder, dset, ext):
         for fname in files:
             file_path = os.path.realpath(fname)
 
-            frames = sf.info(fname).frames
+            if ext == "hdf":
+                with h5py.File(fname, "r") as f:
+                    frames = f["wav"].shape[-1]
+            else:
+                frames = sf.info(fname).frames
             print(
                 "{}\t{}".format(os.path.relpath(file_path, dir_path), frames), file=set_f
             )
