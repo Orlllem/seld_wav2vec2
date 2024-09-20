@@ -1,8 +1,11 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from fairseq.modules import Fp32LayerNorm
 
-from seld_wav2vec2.model.utils import get_activation_fn
+from seld_wav2vec2.model.utils import Fp32BatchNorm1d, get_activation_fn
 
 
 class CausalConv1d(nn.Conv1d):
@@ -75,6 +78,35 @@ class TemporalConv1d(nn.Conv1d):
         x = super(TemporalConv1d, self).forward(x)
 
         return x
+
+
+class TemporalConv2d(nn.Conv2d):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride=1,
+        dilation=1,
+        groups=1,
+        bias=True,
+        **kwargs,
+    ):
+        self.__padding = (kernel_size - 1) * dilation
+
+        super(TemporalConv2d, self).__init__(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding="same",
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+            **kwargs,
+        )
+
+        return
 
 
 class Inception(nn.Module):
@@ -220,4 +252,69 @@ class InceptionTimeModel(nn.Module):
         for block in self.inception_residuals:
             x = block(x)
         x = x.transpose(1, 2)  # B, T, C
+        return x
+
+
+class Conv1dCeil(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride,
+        padding=0,
+        dilation=1,
+        bias=True,
+        norm_type=None,
+        activation_fn=None,
+    ):
+        super().__init__()
+        self.conv = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=0,
+            dilation=dilation,
+            bias=bias,
+        )  # padding handled manually
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.norm_type = norm_type
+
+        if self.norm_type == "batch_norm":
+            self.norm = Fp32BatchNorm1d(in_channels)
+        elif self.norm_type == "layer_norm":
+            self.norm = Fp32LayerNorm(in_channels)
+        else:
+            self.norm = None
+
+        self.activation_fn = get_activation_fn(activation_fn)
+
+    def forward(self, x):
+        L_in = x.shape[-1]
+        effective_kernel = self.dilation * (self.kernel_size - 1) + 1
+
+        # Calculate output length with ceil
+        L_out = (
+            math.ceil((L_in + 2 * self.padding - effective_kernel) / self.stride) + 1
+        )
+
+        # Calculate total padding needed
+        needed = max(
+            0, (L_out - 1) * self.stride + effective_kernel - L_in - 2 * self.padding
+        )
+
+        # Apply extra padding to the right
+        pad_left = self.padding
+        pad_right = self.padding + needed
+
+        x = F.pad(x, (pad_left, pad_right))
+
+        x = self.conv(x)
+        if self.norm_type == "layer_norm":
+            x = self.norm(x.transpose(1, 2)).transpose(1, 2)
+        x = self.activation_fn(x)
         return x
