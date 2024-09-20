@@ -4,39 +4,38 @@ from typing import List
 import torch
 import torch.nn as nn
 from fairseq.dataclass import FairseqDataclass
-from fairseq.models.wav2vec.wav2vec2 import EXTRACTOR_MODE_CHOICES
 from fairseq.modules import Fp32LayerNorm, TransposeLast
+from pytorch_tcn import TCN
 from torch.nn.utils import weight_norm
 
 from seld_wav2vec2.model import conv
-from seld_wav2vec2.model.utils import get_activation_fn
+from seld_wav2vec2.model.utils import Transpose2DLast, get_activation_fn
 
 
 @dataclass
 class TcnConfig(FairseqDataclass):
-    num_inputs: int = field(
-        default=768, metadata={"help": "input size of TCN"}
-    )
+    num_inputs: int = field(default=768, metadata={"help": "input size of TCN"})
     num_channels: List[int] = field(
         default=(768, 768), metadata={"help": "inner dimensions of TCN"}
     )
-    kernel_size: int = field(
-        default=5, metadata={"help": "kernel-size used in TCN"}
-    )
-    stride_size: int = field(default=0, metadata={"help": "stride used in TCN"})
+    kernel_size: int = field(default=5, metadata={"help": "kernel-size used in TCN"})
     causal: bool = field(default=False, metadata={"help": "causal or non-causal TCN"})
-    dropout: float = field(
-        default=0.0, metadata={"help": "dropout of TCN module"}
-    )
-    mode: EXTRACTOR_MODE_CHOICES = field(
-        default="default",
+    dropout: float = field(default=0.0, metadata={"help": "dropout of TCN module"})
+    use_norm: str = field(
+        default="weight_norm",
         metadata={"help": "norm type used in TCN block"},
     )
-    activation_fn: str = field(
+    activation: str = field(
         default="gelu",
         metadata={"help": " activation function of TCN"},
     )
-    btc: bool = field(default=False, metadata={"help": "BTC order"})
+    input_shape: str = field(
+        default="NLC",
+        metadata={"help": "shape of CNN"},
+    )
+    use_skip_connections: bool = field(
+        default=True, metadata={"help": "skip connection"}
+    )
 
 
 @dataclass
@@ -51,13 +50,20 @@ class MultiScaleTcnConfig(FairseqDataclass):
     causal: bool = field(default=False, metadata={"help": "causal or non-causal MSTCN"})
     skip: bool = field(default=True, metadata={"help": "skip connection MSTCN"})
     dropout: float = field(default=0.0, metadata={"help": "dropout of MSTCN module"})
-    mode: EXTRACTOR_MODE_CHOICES = field(
-        default="default",
+    use_norm: str = field(
+        default="weight_norm",
         metadata={"help": "norm type used in TCN block"},
     )
-    activation_fn: str = field(
+    activation: str = field(
         default="gelu",
         metadata={"help": " activation function of TCN"},
+    )
+    input_shape: str = field(
+        default="NLC",
+        metadata={"help": "shape of CNN"},
+    )
+    use_skip_connections: bool = field(
+        default=True, metadata={"help": "skip connection"}
     )
 
 
@@ -73,6 +79,8 @@ class Wav2vec2AudioFrameClassMultiScaleTcnHead(nn.Module):
         self,
         input_dim,
         dropout_input,
+        bidirectional,
+        merge_cat,
         num_outs,
         out_activation_fn,
         cfg: MultiScaleTcnConfig,
@@ -80,6 +88,13 @@ class Wav2vec2AudioFrameClassMultiScaleTcnHead(nn.Module):
         super().__init__()
 
         self.dropout_input = nn.Dropout(p=dropout_input)
+        self.bidirectional = bidirectional
+        self.merge_cat = merge_cat
+
+        embed_dim = len(cfg.kernels) * cfg.num_channels[-1]
+
+        if self.bidirectional and self.merge_cat:
+            embed_dim = 2 * embed_dim
 
         self.ms_tcn = MultiScaleTemporalConv(
             num_inputs=input_dim,
@@ -91,15 +106,70 @@ class Wav2vec2AudioFrameClassMultiScaleTcnHead(nn.Module):
             causal=cfg.causal,
             skip=cfg.skip,
         )
-        self.out_proj = nn.Linear(len(cfg.kernels) * cfg.num_channels[-1], num_outs)
+        if self.bidirectional:
+            self.ms_tcn_r = MultiScaleTemporalConv(
+                num_inputs=input_dim,
+                num_channels=cfg.num_channels,
+                kernels=cfg.kernels,
+                dropout=cfg.dropout,
+                mode=cfg.mode,
+                activation_fn=cfg.activation_fn,
+                causal=cfg.causal,
+                skip=cfg.skip,
+            )
+
+        self.out_proj = nn.Linear(embed_dim, num_outs)
         self.out_activation_fn = get_activation_fn(out_activation_fn)
 
     def forward(self, features, padding_mask=None):
         x = self.dropout_input(features)
-        x = self.ms_tcn(x)
-        x = self.out_proj(x)
-        x = self.out_activation_fn(x)
-        return x
+        r = self.ms_tcn(x)
+
+        if self.bidirectional:
+            x_rl = torch.flip(x, [1])  # reverse T dimension
+            r_rl = self.ms_tcn_r(x_rl)
+            r_rl = torch.flip(r_rl, [1])  # return T again
+            if self.merge_cat:
+                r = torch.cat((r, r_rl), dim=-1)
+            else:
+                r = r + r_rl
+
+        r = self.out_proj(r)
+        r = self.out_activation_fn(r)
+        return r
+
+
+class Wav2vec2AudioFrameClassMultiScaleTcnCatHead(nn.Module):
+    """
+    Head for audioframe classification tasks with MultiScaleTCN.
+
+    It produces outputs of size (B, T, N)
+
+    """
+
+    def __init__(self, input_dim, cfg, num_outs):
+        super().__init__()
+
+        self.cat_heads = nn.ModuleList()
+
+        for d in range(cfg.doa_size):
+            self.cat_heads.append(
+                Wav2vec2AudioFrameClassMultiScaleTcnHead(
+                    input_dim=input_dim,
+                    dropout_input=cfg.regression_input_dropout,
+                    bidirectional=cfg.bidirectional,
+                    merge_cat=cfg.merge_cat,
+                    num_outs=num_outs * cfg.n_bins,
+                    out_activation_fn=cfg.regression_out_activation_fn,
+                    cfg=cfg.regression,
+                )
+            )
+
+    def forward(self, features, padding_mask=None):
+        preds = []
+        for head in self.cat_heads:
+            preds.append(head(features))
+        return torch.cat(preds, dim=-1)
 
 
 class MultiScaleTemporalConv(nn.Module):
@@ -109,14 +179,14 @@ class MultiScaleTemporalConv(nn.Module):
         num_channels: List[int],
         kernels: List[int],
         dropout: float = 0.0,
-        mode: str = "default",
-        activation_fn: str = "gelu",
+        use_norm: str = "weight_norm",
+        activation: str = "gelu",
         causal: bool = False,
         skip: bool = False,
+        input_shape: str = "NLC",
+        use_skip_connections: bool = False,
     ):
         super().__init__()
-
-        assert mode in {"default", "layer_norm"}
 
         self.conv_layers = nn.ModuleList()
         for k in kernels:
@@ -124,15 +194,15 @@ class MultiScaleTemporalConv(nn.Module):
                 "num_inputs": num_inputs,
                 "num_channels": num_channels,
                 "kernel_size": k,
-                "stride_size": 0,
                 "dropout": dropout,
-                "mode": mode,
+                "use_norm": use_norm,
                 "causal": causal,
-                "btc": True,
-                "activation_fn": activation_fn,
+                "input_shape": input_shape,
+                "activation": activation,
+                "use_skip_connections": use_skip_connections,
             }
 
-            self.conv_layers.append(TemporalConvNet(cfg))
+            self.conv_layers.append(TCN(cfg))
 
         self.skip = skip
         if self.skip:
@@ -147,7 +217,7 @@ class MultiScaleTemporalConv(nn.Module):
             else:
                 self.skip_proj = None
 
-        self.act = get_activation_fn(activation_fn)
+        self.act = get_activation_fn(activation)
 
     def forward(self, x):
         r = []
@@ -162,140 +232,6 @@ class MultiScaleTemporalConv(nn.Module):
         return self.act(r)
 
 
-class TemporalBlock(nn.Module):
-    def __init__(
-        self,
-        n_inputs,
-        n_outputs,
-        kernel_size,
-        stride,
-        dilation,
-        dropout=0.2,
-        mode="default",
-        activation_fn="gelu",
-        causal=False,
-    ):
-        super().__init__()
-
-        conv_type = "CausalConv1d" if causal else "TemporalConv1d"
-
-        if mode == "layer_norm":
-            conv1 = nn.Sequential(
-                getattr(conv, conv_type)(
-                    n_inputs,
-                    n_outputs,
-                    kernel_size,
-                    stride=stride,
-                    dilation=dilation,
-                ),
-                TransposeLast(),
-                Fp32LayerNorm(n_outputs, elementwise_affine=True),
-                TransposeLast(),
-            )
-        else:
-            conv1 = weight_norm(
-                getattr(conv, conv_type)(
-                    n_inputs,
-                    n_outputs,
-                    kernel_size,
-                    stride=stride,
-                    dilation=dilation,
-                )
-            )
-        act1 = get_activation_fn(activation_fn)
-        dropout1 = nn.Dropout(dropout)
-
-        if mode == "layer_norm":
-            conv2 = nn.Sequential(
-                getattr(conv, conv_type)(
-                    n_outputs,
-                    n_outputs,
-                    kernel_size,
-                    stride=stride,
-                    dilation=dilation,
-                ),
-                TransposeLast(),
-                Fp32LayerNorm(n_outputs, elementwise_affine=True),
-                TransposeLast(),
-            )
-        else:
-            conv2 = weight_norm(
-                getattr(conv, conv_type)(
-                    n_outputs,
-                    n_outputs,
-                    kernel_size,
-                    stride=stride,
-                    dilation=dilation,
-                )
-            )
-        act2 = get_activation_fn(activation_fn)
-        dropout2 = nn.Dropout(dropout)
-
-        self.net = nn.Sequential(conv1, act1, dropout1, conv2, act2, dropout2)
-        self.skip_proj = (
-            nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
-        )
-        self.act = get_activation_fn(activation_fn)
-
-    def forward(self, x):
-        # x -> (B, C, T)
-        out = self.net(x)
-        res = x if self.skip_proj is None else self.skip_proj(x)
-        return self.act(out + res)
-
-
-class TemporalConvNet(nn.Module):
-    def __init__(self, cfg: TcnConfig):
-        super().__init__()
-
-        self.btc = cfg["btc"]
-        num_channels = cfg["num_channels"]
-        kernel_size = cfg["kernel_size"]
-        stride_size = cfg["stride_size"]
-        layers = []
-        num_levels = len(num_channels)
-        for i in range(num_levels):
-            dilation_size = 2**i
-            in_channels = cfg["num_inputs"] if i == 0 else num_channels[i - 1]
-            out_channels = num_channels[i]
-            layers += [
-                TemporalBlock(
-                    n_inputs=in_channels,
-                    n_outputs=out_channels,
-                    kernel_size=kernel_size,
-                    stride=1,
-                    dilation=dilation_size,
-                    dropout=cfg["dropout"],
-                    causal=cfg["causal"],
-                    mode=cfg["mode"],
-                    activation_fn=cfg["activation_fn"],
-                )
-            ]
-
-        self.encoder = nn.Sequential(*layers)
-        if stride_size > 1:
-            self.downsample = nn.Sequential(
-                nn.Conv1d(
-                    out_channels, out_channels, kernel_size=kernel_size, stride=stride_size
-                ),
-                TransposeLast(),
-                Fp32LayerNorm(out_channels, elementwise_affine=True),
-                TransposeLast(),
-            )
-        else:
-            self.downsample = None
-
-    def forward(self, x, padding_mask=None):
-        if self.btc:
-            x = x.transpose(1, 2)
-        r = self.encoder(x)
-        if self.downsample is not None:
-            r = self.downsample(r)
-        if self.btc:
-            r = r.transpose(1, 2)
-        return r
-
-
 class TemporalResnetBlock(nn.Module):
     def __init__(
         self,
@@ -307,22 +243,30 @@ class TemporalResnetBlock(nn.Module):
         dropout=0.2,
         mode="default",
         activation_fn="gelu",
-        bias=True
+        bias=True,
+        conv1d=True,
     ):
         super().__init__()
 
+        if conv1d is True:
+            conv_layer = "Conv1d"
+            transpose_layer = TransposeLast
+        else:
+            conv_layer = "Conv2d"
+            transpose_layer = Transpose2DLast
+
         if mode == "layer_norm":
             conv1 = nn.Sequential(
-                conv.TemporalConv1d(
+                getattr(conv, f"Temporal{conv_layer}")(
                     n_inputs, n_outputs, kernel_size, stride=1, dilation=1, bias=bias
                 ),
-                TransposeLast(),
+                transpose_layer(),
                 Fp32LayerNorm(n_outputs, elementwise_affine=True),
-                TransposeLast(),
+                transpose_layer(),
             )
         else:
             conv1 = weight_norm(
-                conv.TemporalConv1d(
+                getattr(conv, f"Temporal{conv_layer}")(
                     n_inputs, n_outputs, kernel_size, stride=1, dilation=1, bias=bias
                 )
             )
@@ -331,20 +275,20 @@ class TemporalResnetBlock(nn.Module):
 
         if mode == "layer_norm":
             conv2 = nn.Sequential(
-                nn.Conv1d(
+                getattr(nn, f"{conv_layer}")(
                     n_outputs,
                     n_outputs,
                     kernel_size,
                     stride=stride,
                     dilation=dilation,
                 ),
-                TransposeLast(),
+                transpose_layer(),
                 Fp32LayerNorm(n_outputs, elementwise_affine=True),
-                TransposeLast(),
+                transpose_layer(),
             )
         else:
             conv2 = weight_norm(
-                nn.Conv1d(
+                getattr(nn, f"{conv_layer}")(
                     n_outputs,
                     n_outputs,
                     kernel_size,
@@ -359,20 +303,20 @@ class TemporalResnetBlock(nn.Module):
 
         if mode == "layer_norm":
             self.skip_proj = nn.Sequential(
-                nn.Conv1d(
+                getattr(nn, f"{conv_layer}")(
                     n_inputs,
                     n_outputs,
                     kernel_size,
                     stride=stride,
                     dilation=dilation,
                 ),
-                TransposeLast(),
+                transpose_layer(),
                 Fp32LayerNorm(n_outputs, elementwise_affine=True),
-                TransposeLast(),
+                transpose_layer(),
             )
         else:
             self.skip_proj = weight_norm(
-                nn.Conv1d(
+                getattr(nn, f"{conv_layer}")(
                     n_inputs,
                     n_outputs,
                     kernel_size,
