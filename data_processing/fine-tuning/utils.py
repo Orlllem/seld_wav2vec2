@@ -3,6 +3,7 @@
 """
 Data pre-processing: build train, valid, and test data.
 """
+
 import glob
 import logging
 import os
@@ -16,14 +17,14 @@ logger = logging.getLogger("preprocessing-ft-manifest")
 
 
 def sph2cart(azimuth, elevation, r):
-    '''
+    """
     Convert spherical to cartesian coordinates
 
     :param azimuth: in radians
     :param elevation: in radians
     :param r: in meters
     :return: cartesian coordinates
-    '''
+    """
 
     x = r * np.cos(elevation) * np.cos(azimuth)
     y = r * np.cos(elevation) * np.sin(azimuth)
@@ -32,14 +33,14 @@ def sph2cart(azimuth, elevation, r):
 
 
 def cart2sph(x, y, z):
-    '''
+    """
     Convert cartesian to spherical coordinates
 
     :param x:
     :param y:
     :param z:
     :return: azi, ele in radians and r in meters
-    '''
+    """
 
     azimuth = np.arctan2(y, x)
     elevation = np.arctan2(z, np.sqrt(x**2 + y**2))
@@ -69,11 +70,22 @@ def gen_tsv_manifest(save_folder, manifest_folder, dset, ext):
             if ext == "hdf":
                 with h5py.File(fname, "r") as f:
                     frames = f["wav"].shape[-1]
+                print(
+                    "{}\t{}".format(
+                        os.path.relpath(file_path, dir_path), frames
+                    ),
+                    file=set_f,
+                )
             else:
-                frames = sf.info(fname).frames
-            print(
-                "{}\t{}".format(os.path.relpath(file_path, dir_path), frames), file=set_f
-            )
+                info = sf.info(fname)
+                frames = info.frames
+                channels = info.channels
+                print(
+                    "{}\t{}\t{}".format(
+                        os.path.relpath(file_path, dir_path), frames, channels
+                    ),
+                    file=set_f,
+                )
 
 
 def get_feat_extract_output_lengths(conv_feature_layers, input_lengths):
@@ -95,14 +107,14 @@ def get_feat_extract_output_lengths(conv_feature_layers, input_lengths):
 
 
 def cart2sph_array(array):
-    '''
+    """
     Convert cartesian to spherical coordinates
 
     :param x:
     :param y:
     :param z:
     :return: azi, ele in radians and r in meters
-    '''
+    """
 
     assert array.shape[-1] == 3
 
@@ -119,19 +131,16 @@ def cart2sph_array(array):
 
     r_sel = r[r != 0]
 
-    assert np.allclose(
-        r_sel, [1.0]*len(r_sel), atol=1e-05), r_sel
+    assert np.allclose(r_sel, [1.0] * len(r_sel), atol=1e-05), r_sel
 
     return np.stack((elevation, azimuth), axis=-1).reshape(B, T, -1)
 
 
 def remove_overlap_same_class(df):
-
     index_to_remove = []
 
-    if any(df.duplicated(subset=['frame_number'])):
-
-        df_frames = df[df.duplicated(subset=['frame_number'], keep=False)]
+    if any(df.duplicated(subset=["frame_number"])):
+        df_frames = df[df.duplicated(subset=["frame_number"], keep=False)]
 
         for i in range(len(df_frames)):
             frame = df_frames.iloc[i]["frame_number"]
@@ -139,7 +148,6 @@ def remove_overlap_same_class(df):
             df_frames_sub = df_frames[df_frames["frame_number"] == int(frame)]
 
             if len(df_frames_sub["sound_event_recording"].unique()) == 1:
-
                 if len(df_frames_sub) == 2:
                     assert len(df_frames_sub) == 2
                     index_to_remove.append(df_frames_sub.index.tolist()[-1])
@@ -151,7 +159,6 @@ def remove_overlap_same_class(df):
     index_to_remove = list(set(index_to_remove))
 
     if len(index_to_remove) > 0:
-
         df = df.drop(index=index_to_remove)
 
         return df
@@ -162,5 +169,5 @@ def remove_overlap_same_class(df):
 def linear_interp(xp, x, y):
     x1, x2 = x
     y1, y2 = y
-    yp = ((y2-y1)/(x2 - x1))*(xp - x1) + y1
+    yp = ((y2 - y1) / (x2 - x1)) * (xp - x1) + y1
     return yp
