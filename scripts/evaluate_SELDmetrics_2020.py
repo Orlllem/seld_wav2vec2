@@ -11,8 +11,8 @@ from fairseq import checkpoint_utils
 from fairseq.utils import move_to_cuda
 from torch.utils.data import DataLoader
 
-import seld_wav2vec2.criterions.cls_feature_class as cls_feature_class
 import seld_wav2vec2.criterions.parameter as parameter
+from seld_wav2vec2.criterions.ccls_feature_class import FeatureClass
 from seld_wav2vec2.criterions.evaluation_metrics import early_stopping_metric
 from seld_wav2vec2.criterions.multi_label_regression import reshape_3Dto2D
 from seld_wav2vec2.criterions.SELD_evaluation_metrics import SELDMetrics
@@ -37,8 +37,11 @@ def evaluate(
     doa_size=3,
     label_hop_len_s=0.02,
     data=None,
+    segment_eval=None,
+    labels=None,
     thr=0.5,
     use_best_threshold=False,
+    per_task_sliding_window_overlap=None,
 ):
     Arg = namedtuple("Arg", ["user_dir"])
     arg = Arg(user_dir.__str__())
@@ -50,9 +53,24 @@ def evaluate(
     if data is not None:
         task.cfg.data = data
 
+    if labels is not None:
+        task.cfg.labels = labels
+
+    if segment_eval is not None:
+        task.cfg.segment_eval = bool(segment_eval)
+
+        logger.info("evaluating in segment_eval mode")
+        logger.info(f"segment_eval: {task.cfg.segment_eval}")
+
     model.w2v_encoder.apply_mask = False
     task.cfg.audio_augm = False
     task.cfg.random_crop = False
+    task.cfg.label_hop_len_s = label_hop_len_s
+    task.cfg.max_sample_size = None
+
+    if per_task_sliding_window_overlap is not None:
+        task.cfg.per_task_sliding_window_overlap = bool(per_task_sliding_window_overlap)
+
     task.load_dataset(subset)
 
     if use_best_threshold:
@@ -64,7 +82,7 @@ def evaluate(
     params["fs"] = SAMPLE_RATE
     params["label_hop_len_s"] = label_hop_len_s  # 20ms or 100ms
 
-    feat_cls = cls_feature_class.FeatureClass(params)
+    feat_cls = FeatureClass(params)
     cls_new_metric = SELDMetrics(nb_classes=task.cfg.nb_classes)
 
     logger.info("iterating over data")
@@ -78,7 +96,10 @@ def evaluate(
     for batch in batch_itr:
         with torch.no_grad():
             batch = move_to_cuda(batch)
-            net_output = model(**batch["net_input"])
+            if task.cfg.segment_eval:
+                net_output = model(**batch["net_input"])
+            else:
+                net_output, batch = task.inference_step(batch, model)
 
             class_logits = net_output["class_encoder_out"].float()
             reg_logits = net_output["regression_out"].float()
@@ -171,13 +192,16 @@ if __name__ == "__main__":
     )
     parser.add_argument("--doa_size", default=3, type=int, help="Size of DOA.")
     parser.add_argument(
-        "--label_hop_len_s", default=0.02, type=float, help="Hop len of labels"
+        "--label_hop_len_s", default=0.02, type=float, help="hop len of labels"
     )
-    parser.add_argument(
-        "--data", type=str, help=("path and name of output metrics file.")
-    )
+    parser.add_argument("--data", type=str, help=("path to the data."))
+    parser.add_argument("--labels", type=str, default="labels", help="labels path")
+    parser.add_argument("--segment_eval", type=int, help=("segment_eval [0,1] in cfg."))
     parser.add_argument("--threshold", default=0.5, type=float, help="Size of DOA.")
     parser.add_argument("--use_best_threshold", action="store_true")
+    parser.add_argument(
+        "--per_task_sliding_window_overlap", type=int, help=("overlap for sliding window for each task.")
+    )
 
     args = parser.parse_args()
     evaluate(
@@ -189,6 +213,9 @@ if __name__ == "__main__":
         doa_size=args.doa_size,
         label_hop_len_s=args.label_hop_len_s,
         data=args.data,
+        labels=args.labels,
         thr=args.threshold,
+        segment_eval=args.segment_eval,
         use_best_threshold=args.use_best_threshold,
+        per_task_sliding_window_overlap=args.per_task_sliding_window_overlap
     )
