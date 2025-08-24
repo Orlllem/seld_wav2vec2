@@ -92,8 +92,6 @@ class TemporalConv2d(nn.Conv2d):
         bias=True,
         **kwargs,
     ):
-        self.__padding = (kernel_size - 1) * dilation
-
         super(TemporalConv2d, self).__init__(
             in_channels=in_channels,
             out_channels=out_channels,
@@ -229,7 +227,9 @@ class ResidualInception(nn.Module):
 
 
 class InceptionTimeModel(nn.Module):
-    def __init__(self, input_size, filters, depth, activation_fn, dropout, batch_norm=True):
+    def __init__(
+        self, input_size, filters, depth, activation_fn, dropout, batch_norm=True
+    ):
         super(InceptionTimeModel, self).__init__()
 
         assert depth % 3 == 0, f"depth: {depth} must be divisible by 3"

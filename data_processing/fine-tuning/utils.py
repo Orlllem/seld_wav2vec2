@@ -16,6 +16,10 @@ import torch
 logger = logging.getLogger("preprocessing-ft-manifest")
 
 
+def _next_greater_power_of_2(x):
+    return 2 ** (x - 1).bit_length()
+
+
 def sph2cart(azimuth, elevation, r):
     """
     Convert spherical to cartesian coordinates
@@ -71,9 +75,7 @@ def gen_tsv_manifest(save_folder, manifest_folder, dset, ext):
                 with h5py.File(fname, "r") as f:
                     frames = f["wav"].shape[-1]
                 print(
-                    "{}\t{}".format(
-                        os.path.relpath(file_path, dir_path), frames
-                    ),
+                    "{}\t{}".format(os.path.relpath(file_path, dir_path), frames),
                     file=set_f,
                 )
             else:
@@ -97,6 +99,29 @@ def get_feat_extract_output_lengths(conv_feature_layers, input_lengths):
         return torch.floor((input_length - kernel_size) / stride + 1)
 
     conv_cfg_list = eval(conv_feature_layers)
+
+    for i in range(len(conv_cfg_list)):
+        input_lengths = _conv_out_length(
+            input_lengths, conv_cfg_list[i][1], conv_cfg_list[i][2]
+        )
+
+    return input_lengths.to(torch.long)
+
+
+def get_feat_extract_output_lengths_spec(
+    conv_feature_layers, spec_transform, input_lengths
+):
+    """
+    Computes the output length of the convolutional layers
+    """
+
+    def _conv_out_length(input_length, kernel_size, stride):
+        return torch.floor((input_length - kernel_size) / stride + 1)
+
+    conv_cfg_list = eval(conv_feature_layers)
+
+    input_rand = torch.zeros(1, input_lengths)
+    input_lengths = torch.tensor(spec_transform(input_rand).shape[-1])
 
     for i in range(len(conv_cfg_list)):
         input_lengths = _conv_out_length(
