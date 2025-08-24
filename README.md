@@ -77,7 +77,7 @@ tree
 
 ### Setup
 ```
-$ conda create -n seld_w2v_dvc python=3.8 -y
+$ conda create -n seld_w2v_dvc python=3.10 libsndfile=1.2.2 -y
 $ conda activate seld_w2v_dvc
 (seld_w2v_dvc) $ cd seld_wav2vec2/
 ```
@@ -118,21 +118,9 @@ and to execute a single step ```stage```
 ## Install and development (DEV)
 
 ```
-$ conda create -n seld_w2v python=3.8 cudatoolkit=11.3 cuDNN=8.2 -y
+$ conda create -n seld_w2v python=3.10 pip=23.3.1 nvidia/label/cuda-12.1.0::cuda-toolkit libsndfile=1.2.2 -c conda-forge -c pytorch -c nvidia -y
 $ conda activate seld_w2v
 (seld_w2v) $ cd seld_wav2vec2/
-```
-
-Install libsndfile library
-
-```
-(seld_w2v) $ conda install -c conda-forge libsndfile -y
-```
-
-if you using GPU, I recommend to use CUDA 11.3 (or the next one)
-
-```
-(seld_w2v) $ conda install pytorch==1.12.1 torchvision==0.13.1 torchaudio==0.12.1 cudatoolkit=11.3 cuDNN=8.2 -c pytorch -y
 ```
 
 Then install the setup.py
@@ -140,19 +128,6 @@ Then install the setup.py
 ```
 (seld_w2v) $ pip install -r dev-requirements.txt
 (seld_w2v) $ pip install -e . --no-deps
-```
-
-Also, for faster training install NVIDIA's apex library
-
-```
-(seld_w2v) $ git clone https://github.com/NVIDIA/apex
-(seld_w2v) $ cd apex
-
-(seld_w2v) $ export CUDA_HOME=/usr/local/cuda-11.3
-
-(seld_w2v) $ pip install -v --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" \
-  --global-option="--deprecated_fused_adam" --global-option="--xentropy" \
-  --global-option="--fast_multihead_attn" ./
 ```
 
 ## Pre-training
@@ -195,22 +170,21 @@ seld_wav2vec2(-py) is MIT-licensed.
 The license applies to the pre-trained models as well.
 
 
-# Paper Arxiv
+# Paper
 
 
-[w2v-SELD: A Sound Event Localization and Detection Framework for Self-Supervised Spatial Audio Pre-Training](http://arxiv.org/abs/2312.06907)
+[w2v-SELD: A Sound Event Localization and Detection Framework for Self-Supervised Spatial Audio Pre-Training](https://ieeexplore.ieee.org/document/10772471)
 
 # Citation
 
 Please cite as:
 
 ``` bibtex
-@misc{santos2023w2vseld,
-      title={w2v-SELD: A Sound Event Localization and Detection Framework for Self-Supervised Spatial Audio Pre-Training}, 
-      author={Orlem Lima dos Santos and Karen Rosero and Roberto de Alencar Lotufo},
-      year={2023},
-      eprint={2312.06907},
-      archivePrefix={arXiv},
-      primaryClass={eess.AS}
+@article{santos2024w2v,
+  title={w2v-SELD: A sound event localization and detection framework for self-supervised spatial audio pre-training},
+  author={Santos, Orlem and Rosero, Karen and Masiero, Bruno and de Alencar Lotufo, Roberto},
+  journal={IEEE Access},
+  year={2024},
+  publisher={IEEE}
 }
 ```
