@@ -40,7 +40,6 @@ from omegaconf import II, MISSING, open_dict
 
 from seld_wav2vec2.model.tcn import TemporalResnetBlock
 from seld_wav2vec2.model.utils import (
-    Fp32InstanceNorm,
     Fp32InstanceNorm2d,
     Transpose2DLast,
 )
@@ -1802,7 +1801,7 @@ class ResnetFeatureExtractionChModel(nn.Module):
         self.conv1d = conv1d
         if learn_norm_input:
             if self.conv1d:
-                self.norm_input = Fp32InstanceNorm(in_channels, affine=True)
+                self.norm_input = nn.InstanceNorm1d(in_channels, affine=True)
             else:
                 self.norm_input = Fp32InstanceNorm2d(in_channels, affine=True)
         else:
