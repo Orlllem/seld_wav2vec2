@@ -2,6 +2,7 @@ import copy
 import glob
 import itertools
 import logging
+import math
 import os
 import shutil
 
@@ -54,18 +55,33 @@ unique_classes_dict = {
 }
 
 
-def get_original_DOA_100ms(df, num_classes):
-    ele = np.zeros((num_classes, max(df["frame_number"])))
-    azi = np.zeros((num_classes, max(df["frame_number"])))
-    ele[:] = np.nan
-    azi[:] = np.nan
+def get_original_DOA_100ms(df, num_classes, max_size):
+    ele_array_f = np.zeros((num_classes, max_size))
+    azi_array_f = np.zeros((num_classes, max_size))
+    ele_array_f[:] = np.nan
+    azi_array_f[:] = np.nan
 
-    for index, row in df.iterrows():
-        class_id = int(row["sound_event_recording"])
-        ele[class_id, int(row["frame_number"]) - 1] = row["ele"]
-        azi[class_id, int(row["frame_number"]) - 1] = row["azi"]
+    for class_i in unique_classes_dict.keys():
+        df_class = df[df["sound_event_recording"] == class_i]
 
-    return ele, azi
+        df_class_index = df_class.index
+
+        for i in range(len(df_class_index)):
+            start_time = df_class["start_time"][df_class_index[i]]
+            end_time = df_class["end_time"][df_class_index[i]]
+            ele = df_class["ele"][df_class_index[i]]
+            azi = df_class["azi"][df_class_index[i]]
+
+            start = int(np.floor(start_time * 10))
+            end = int(np.floor(end_time * 10))
+
+            ele_array = np.asarray([ele] * (end - start))
+            azi_array = np.asarray([azi] * (end - start))
+
+            ele_array_f[unique_classes_dict[class_i], start:end] = ele_array
+            azi_array_f[unique_classes_dict[class_i], start:end] = azi_array
+
+    return ele_array_f, azi_array_f
 
 
 def get_array_class(array_ele, array_azi):
@@ -195,14 +211,18 @@ def preprocess_waves_metadata(
         assert not np.isnan(array_ele).all()
         assert not np.isnan(array_azi).all()
 
-        if vizualize_figs:
-            orig_ele, orig_azi = get_original_DOA_100ms(df, num_classes=num_classes)
-            orig_class = get_array_class(array_ele=orig_ele, array_azi=orig_azi)
-            array_class = get_array_class(array_ele=array_ele, array_azi=array_azi)
+        array_class = get_array_class(array_ele=array_ele, array_azi=array_azi)
 
         class_dict = []
 
         input_length = torch.tensor(array_ele.shape[1])
+
+        orig_ele, orig_azi = get_original_DOA_100ms(
+            df,
+            num_classes=num_classes,
+            max_size=math.ceil(array_ele.shape[1] / (FS_TARGET * 0.1)),
+        )
+        orig_class = get_array_class(array_ele=orig_ele, array_azi=orig_azi)
 
         # make sure that the wave lenghth is equal to x, z length
         assert wav_resampled.shape[1] == input_length, (
@@ -332,10 +352,18 @@ def preprocess_waves_metadata(
         assert orig_y.shape[0] == num_classes
         assert orig_z.shape[0] == num_classes
 
-        doa_labels_100ms = np.concatenate((orig_x, orig_y, orig_z), axis=-1)
+        doa_labels_100ms = np.concatenate((orig_x, orig_y, orig_z), axis=0).T
+        sed_labels_100ms = orig_class.T
 
         assert doa_labels.shape[1] == 3 * num_classes
         assert sed_labels.shape[1] == num_classes
+
+        assert doa_labels_100ms.shape[1] == 3 * num_classes, (
+            f"{doa_labels_100ms.shape[1]}!={3 * num_classes}"
+        )
+        assert sed_labels_100ms.shape[1] == num_classes, (
+            f"{sed_labels_100ms.shape[1]}!={num_classes}"
+        )
 
         class_dict.append({"sed_labels": sed_labels, "doa_labels": doa_labels})
 
@@ -404,13 +432,17 @@ def preprocess_waves_metadata(
 
         wav_names.append(save_filename)
 
+        # fill nan with 0 for sed, doa 100ms
+        doa_labels_100ms[np.isnan(doa_labels_100ms)] = 0
+        sed_labels_100ms[np.isnan(sed_labels_100ms)] = 0
+
         with h5py.File(save_filename, "w") as f:
             wav_set = f.create_dataset("wav", data=wav_resampled)
             wav_set.attrs["sample_rate"] = FS_TARGET
 
             f.create_dataset("sed_labels", data=sed_labels)
             f.create_dataset("doa_labels", data=doa_labels)
-            f.create_dataset("sed_labels_100ms", data=orig_class)
+            f.create_dataset("sed_labels_100ms", data=sed_labels_100ms)
             f.create_dataset("doa_labels_100ms", data=doa_labels_100ms)
 
     return dict_files, wav_names
