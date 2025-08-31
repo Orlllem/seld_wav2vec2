@@ -220,8 +220,16 @@ class FileEventDataset(FileAudioDataset):
                 target_size = self.max_sample_size
             else:
                 target_size = min(max(sizes), self.max_sample_size)
+
+            if target_size % self.sample_rate != 0:
+                target_size = (
+                    math.ceil(target_size / self.sample_rate) * self.sample_rate
+                )
         else:
             target_size = min(min(sizes), self.max_sample_size)
+
+        # save to use later if necessary
+        self.target_size = target_size
 
         collated_sources = sources[0].new_zeros(
             len(sources), sources[0].shape[0], target_size
@@ -700,15 +708,6 @@ class FileEventHdfDataset(FileEventDataset):
                     if (split == "train" and wav_size > self.min_sample_size) or (
                         split != "train" and wav_size > 0
                     ):
-                        self.fnames_segments.append(
-                            {
-                                "fn": fn,
-                                "start": wav_start,
-                                "end": wav_end,
-                            }
-                        )
-                        self.sizes.append(wav_size)
-
                         labels_start = self.length_spectrogram(i)
                         if labels_start < 0:
                             labels_start = 0
@@ -717,16 +716,29 @@ class FileEventHdfDataset(FileEventDataset):
                         labels_end = labels_start + n_frames
                         labels_size = len(sed_labels[labels_start:labels_end])
 
-                        assert labels_size == n_frames, (
-                            f"fn: {fn}, labels_size: {labels_size} != n_frames: {n_frames}, wav_size: {wav_size}, "
-                        )
+                        if labels_size > 0:
+                            self.fnames_segments.append(
+                                {
+                                    "fn": fn,
+                                    "start": wav_start,
+                                    "end": wav_end,
+                                }
+                            )
+                            self.sizes.append(wav_size)
 
-                        labels.append(
-                            {
-                                "sed_labels": sed_labels[labels_start:labels_end],
-                                "doa_labels": doa_labels[labels_start:labels_end],
-                            }
-                        )
+                            assert n_frames > 0 and labels_size > 0, (
+                                "number frames and labels should be greater than 0"
+                            )
+                            assert labels_size == n_frames, (
+                                f"fn: {fn}, labels_size: {labels_size} != n_frames: {n_frames}, wav_size: {wav_size}"
+                            )
+
+                            labels.append(
+                                {
+                                    "sed_labels": sed_labels[labels_start:labels_end],
+                                    "doa_labels": doa_labels[labels_start:labels_end],
+                                }
+                            )
 
             else:
                 self.fnames_segments.append(
