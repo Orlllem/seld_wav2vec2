@@ -140,6 +140,7 @@ class AddTargetSeldAudioFrameClassDataset(AddTargetEventDataset):
         super().__init__(dataset, labels)
 
         self.n_classes = n_classes
+        self.align_outputs_frames = self.dataset.align_outputs_frames
 
         if doa_swap_augment and shift_augment:
             self.swap_transform = RandomSwapChannel(
@@ -183,7 +184,13 @@ class AddTargetSeldAudioFrameClassDataset(AddTargetEventDataset):
         doa_labels = [s["doa_labels"] for s in samples if s["id"] in indices]
 
         sizes = [len(t) for t in sed_labels]
-        target_size = max(sizes)
+
+        if self.align_outputs_frames:
+            target_size = self.dataset.length_spectrogram(self.dataset.target_size)
+
+            assert target_size >= max(sizes), (target_size, max(sizes))
+        else:
+            target_size = max(sizes)
 
         # (B, T, N)
         collated_sed_labels = sed_labels[0].new_zeros(
