@@ -10,6 +10,8 @@ import numpy as np
 import torch
 from fairseq import checkpoint_utils
 from fairseq.utils import move_to_cuda
+from torch.utils.data import DataLoader
+
 from seld_wav2vec2.criterions.evaluation_metrics import (
     compute_doa_scores_regr_xyz,
     compute_sed_scores,
@@ -17,7 +19,6 @@ from seld_wav2vec2.criterions.evaluation_metrics import (
 )
 from seld_wav2vec2.criterions.multi_label_regression import reshape_3Dto2D
 from seld_wav2vec2.task.sound_event_finetuning import nb_label_frames_1s
-from torch.utils.data import DataLoader
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -36,6 +37,7 @@ def evaluate(
     user_dir,
     doa_size=3,
     data=None,
+    segment_eval=None,
     thr=0.5,
     use_best_threshold=False,
 ):
@@ -49,15 +51,23 @@ def evaluate(
     if data is not None:
         task.cfg.data = data
 
+    if segment_eval is not None:
+        task.cfg.segment_eval = bool(segment_eval)
+
+    logger.info(f"evaluating in segment_eval: {task.cfg.segment_eval}")
+
     model.w2v_encoder.apply_mask = False
     task.cfg.audio_augm = False
     task.cfg.random_crop = False
     task.cfg.spec_augment = False
+    task.cfg.max_sample_size = None
     task.load_dataset(subset)
 
     if use_best_threshold:
         thr = task.best_threshold
         logger.info(f"evaluating using best_threshold: {thr}")
+
+    logger.info(task.cfg)
 
     logger.info("iterating over data")
     batch_itr = DataLoader(
@@ -72,7 +82,10 @@ def evaluate(
     for batch in batch_itr:
         with torch.no_grad():
             batch = move_to_cuda(batch)
-            net_output = model(**batch["net_input"])
+            if task.cfg.segment_eval:
+                net_output = model(**batch["net_input"])
+            else:
+                net_output, batch = task.inference_step(batch, model)
 
             class_logits = net_output["class_encoder_out"].float()
             reg_logits = net_output["regression_out"].float()
@@ -180,6 +193,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data", type=str, help=("path and name of output metrics file.")
     )
+    parser.add_argument("--segment_eval", type=int, help=("segment_eval [0,1] in cfg."))
     parser.add_argument("--threshold", default=0.5, type=float, help="threshold.")
     parser.add_argument("--use_best_threshold", action="store_true")
 
@@ -190,8 +204,8 @@ if __name__ == "__main__":
         args.batch_size,
         args.output_file_path,
         args.user_dir,
-        args.doa_size,
-        args.data,
-        args.threshold,
-        args.use_best_threshold,
+        doa_size=args.doa_size,
+        data=args.data,
+        segment_eval=args.segment_eval,
+        use_best_threshold=args.use_best_threshold,
     )

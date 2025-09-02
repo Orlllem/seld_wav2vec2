@@ -59,8 +59,7 @@ def evaluate(
     if segment_eval is not None:
         task.cfg.segment_eval = bool(segment_eval)
 
-        logger.info("evaluating in segment_eval mode")
-        logger.info(f"segment_eval: {task.cfg.segment_eval}")
+    logger.info(f"evaluating in segment_eval: {task.cfg.segment_eval}")
 
     model.w2v_encoder.apply_mask = False
     task.cfg.audio_augm = False
@@ -84,6 +83,8 @@ def evaluate(
 
     feat_cls = FeatureClass(params)
     cls_new_metric = SELDMetrics(nb_classes=task.cfg.nb_classes)
+
+    logger.info(task.cfg)
 
     logger.info("iterating over data")
     batch_itr = DataLoader(
