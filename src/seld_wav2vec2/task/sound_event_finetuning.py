@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import scipy.signal
 import torch
+import torch.nn.functional as F
 from fairseq.data.text_compressor import TextCompressionLevel
 from fairseq.dataclass import ChoiceEnum, FairseqDataclass
 from fairseq.logging import metrics
@@ -284,15 +285,15 @@ class SoundEventPretrainingTask(AudioPretrainingTask):
         if self.cfg.spectrogram_input:
             self.datasets[split] = FileEventSpecDataset(
                 manifest_path=manifest_path,
-                sample_rate=task_cfg.get("sample_rate", self.cfg.sample_rate),
+                sample_rate=self.cfg.get("sample_rate", self.cfg.sample_rate),
                 jit=False,
                 raw_audio_input=self.cfg.raw_audio_input,
                 max_sample_size=self.cfg.max_sample_size,
                 min_sample_size=self.cfg.min_sample_size,
                 shuffle=shuffle,
-                pad=task_cfg.enable_padding,
+                pad=self.cfg.enable_padding,
                 pad_max=False,
-                normalize=task_cfg.normalize,
+                normalize=self.cfg.normalize,
                 spec_normalize=self.cfg.spec_normalize,
                 log_spec_normalize=self.cfg.log_spec_normalize,
                 norm_spec_foaiv=self.cfg.norm_spec_foaiv,
@@ -312,12 +313,12 @@ class SoundEventPretrainingTask(AudioPretrainingTask):
         else:
             self.datasets[split] = FileEventDataset(
                 manifest_path=manifest_path,
-                sample_rate=task_cfg.get("sample_rate", self.cfg.sample_rate),
+                sample_rate=self.cfg.get("sample_rate", self.cfg.sample_rate),
                 max_sample_size=self.cfg.max_sample_size,
                 min_sample_size=self.cfg.min_sample_size,
-                pad=task_cfg.enable_padding,
+                pad=self.cfg.enable_padding,
                 pad_max=False,
-                normalize=task_cfg.normalize,
+                normalize=self.cfg.normalize,
                 norm_per_channel=self.cfg.norm_per_channel,
                 num_buckets=self.cfg.num_batch_buckets or int(self.cfg.tpu),
                 text_compression_level=text_compression_level,
@@ -473,6 +474,10 @@ class SoundEventFinetuningConfig(SoundEventPretrainingConfig):
     segment_stride: float = field(
         default=1.0,
         metadata={"help": "segment stride size in seconds"},
+    )
+    segment_in_seconds: bool = field(
+        default=True,
+        metadata={"help": "whether segment_window and segment_stride are in seconds"},
     )
     opt_threshold_range: Tuple[float, float, float] = field(
         default=(0.1, 1.0, 0.025),
@@ -693,14 +698,14 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
             if self.cfg.hdf_dataset:
                 self.datasets[split] = FileEventSpecHdfDataset(
                     manifest_path=manifest_path,
-                    sample_rate=task_cfg.get("sample_rate", self.cfg.sample_rate),
+                    sample_rate=self.cfg.get("sample_rate", self.cfg.sample_rate),
                     raw_audio_input=self.cfg.raw_audio_input,
                     max_sample_size=self.cfg.max_sample_size,
                     min_sample_size=self.cfg.min_sample_size,
                     shuffle=shuffle,
-                    pad=task_cfg.enable_padding,
+                    pad=self.cfg.enable_padding,
                     pad_max=False,
-                    normalize=task_cfg.normalize,
+                    normalize=self.cfg.normalize,
                     spec_normalize=self.cfg.spec_normalize,
                     norm_spec_foaiv=self.cfg.norm_spec_foaiv,
                     use_foaiv=self.cfg.use_foaiv,
@@ -724,14 +729,14 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
             else:
                 self.datasets[split] = FileEventSpecDataset(
                     manifest_path=manifest_path,
-                    sample_rate=task_cfg.get("sample_rate", self.cfg.sample_rate),
+                    sample_rate=self.cfg.get("sample_rate", self.cfg.sample_rate),
                     raw_audio_input=self.cfg.raw_audio_input,
                     max_sample_size=self.cfg.max_sample_size,
                     min_sample_size=self.cfg.min_sample_size,
                     shuffle=shuffle,
-                    pad=task_cfg.enable_padding,
+                    pad=self.cfg.enable_padding,
                     pad_max=False,
-                    normalize=task_cfg.normalize,
+                    normalize=self.cfg.normalize,
                     spec_normalize=self.cfg.spec_normalize,
                     norm_spec_foaiv=self.cfg.norm_spec_foaiv,
                     use_foaiv=self.cfg.use_foaiv,
@@ -756,13 +761,13 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
             if self.cfg.hdf_dataset:
                 self.datasets[split] = FileEventHdfDataset(
                     manifest_path=manifest_path,
-                    sample_rate=task_cfg.get("sample_rate", self.cfg.sample_rate),
+                    sample_rate=self.cfg.get("sample_rate", self.cfg.sample_rate),
                     max_sample_size=self.cfg.max_sample_size,
                     min_sample_size=self.cfg.min_sample_size,
                     shuffle=shuffle,
-                    pad=task_cfg.labels is not None or task_cfg.enable_padding,
+                    pad=self.cfg.labels is not None and self.cfg.enable_padding,
                     pad_max=self.cfg.padding_max,
-                    normalize=task_cfg.normalize,
+                    normalize=self.cfg.normalize,
                     norm_per_channel=self.cfg.norm_per_channel,
                     num_buckets=self.cfg.num_batch_buckets or int(self.cfg.tpu),
                     text_compression_level=text_compression_level,
@@ -776,13 +781,13 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
             else:
                 self.datasets[split] = FileEventDataset(
                     manifest_path=manifest_path,
-                    sample_rate=task_cfg.get("sample_rate", self.cfg.sample_rate),
+                    sample_rate=self.cfg.get("sample_rate", self.cfg.sample_rate),
                     max_sample_size=self.cfg.max_sample_size,
                     min_sample_size=self.cfg.min_sample_size,
                     shuffle=shuffle,
-                    pad=task_cfg.labels is not None or task_cfg.enable_padding,
+                    pad=self.cfg.labels is not None or self.cfg.enable_padding,
                     pad_max=self.cfg.padding_max,
-                    normalize=task_cfg.normalize,
+                    normalize=self.cfg.normalize,
                     norm_per_channel=self.cfg.norm_per_channel,
                     num_buckets=self.cfg.num_batch_buckets or int(self.cfg.tpu),
                     text_compression_level=text_compression_level,
@@ -793,9 +798,28 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
                 )
 
         if self.cfg.hdf_dataset:
+            if self.cfg.get("segment_in_seconds", True):
+                segment_window = int(self.cfg.segment_window * self.cfg.sample_rate)
+                segment_stride = int(self.cfg.segment_stride * self.cfg.sample_rate)
+            else:
+                segment_window = int(
+                    self.cfg.segment_window
+                    * self.cfg.sample_rate
+                    * self.cfg.label_hop_len_s
+                )
+                segment_stride = int(
+                    self.cfg.segment_stride
+                    * self.cfg.sample_rate
+                    * self.cfg.label_hop_len_s
+                )
+
+            logger.info(
+                f"Segment window: {segment_window}, segment_stride: {segment_stride}"
+            )
+
             labels, doa_discretizer_tf = self.datasets[split].segment_and_get_labels(
-                window=int(self.cfg.segment_window * self.cfg.sample_rate),
-                stride=int(self.cfg.segment_stride * self.cfg.sample_rate),
+                window=segment_window,
+                stride=segment_stride,
                 segment_eval=self.cfg.segment_eval,
                 split=split,
                 doa_discretizer=self.cfg.doa_discretizer
@@ -807,7 +831,7 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
             )
             self.state["doa_discretizer_tf"] = doa_discretizer_tf
         else:
-            label_path = os.path.join(data_path, f"{split}.{task_cfg.labels}")
+            label_path = os.path.join(data_path, f"{split}.{self.cfg.labels}")
 
             with open(label_path, "r") as f:
                 labels = json.load(f)
@@ -851,8 +875,8 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
 
     def sliding_window_overlap_per_task(
         self,
-        source: torch.Tensor,           # [1, C, T_samples]
-        padding_mask: torch.Tensor,     # [1, T_samples]
+        source: torch.Tensor,  # [1, C, T_samples]
+        padding_mask: torch.Tensor,  # [1, T_samples]
         model,
         num_classes: int = 14,
     ):
@@ -869,23 +893,33 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
         total_frames = self.length_spectrogram(T)
         doa_size = self.cfg.doa_size
 
+        # Pad to multiple of stride
+        padding_size = window - (source.shape[-1] % stride)
+        source = F.pad(source, (0, padding_size), value=0.0)
+        padding_mask = F.pad(padding_mask, (0, padding_size), value=True)
+
         # Unfold into overlapping chunks
         chunks = source.unfold(-1, window, stride)  # [1, C, N, window]
         chunks = chunks.transpose(1, 2).squeeze(0)  # [N, C, window]
         chunk_masks = padding_mask.unfold(1, window, stride).squeeze(0)  # [N, window]
         N = chunks.shape[0]
 
+        # Inference on all chunks
         out = model(source=chunks, padding_mask=chunk_masks)
         class_preds = out["class_encoder_out"]  # [N, F, num_classes]
-        reg_preds = out["regression_out"]       # [N, F, num_classes * doa_size]
-        _, F, _ = class_preds.shape
+        reg_preds = out["regression_out"]  # [N, F, num_classes * doa_size]
+        _, frames_number, _ = class_preds.shape
 
         # Create weights
-        weight_class = torch.hann_window(F, periodic=False, device=device).view(1, F, 1)
+        weight_class = torch.hann_window(
+            frames_number, periodic=False, device=device
+        ).view(1, frames_number, 1)
+        weight_class = weight_class.clamp(min=1e-3)
         weight_reg = torch.tensor(
-            scipy.signal.windows.gaussian(F, std=F // 6),
-            dtype=torch.float32, device=device
-        ).view(1, F, 1)
+            scipy.signal.windows.gaussian(frames_number, std=frames_number // 6),
+            dtype=torch.float32,
+            device=device,
+        ).view(1, frames_number, 1)
 
         weight_class = weight_class.expand(N, -1, num_classes)
         weight_reg = weight_reg.expand(N, -1, num_classes * doa_size)
@@ -893,25 +927,38 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
         weighted_class = class_preds * weight_class
         weighted_reg = reg_preds * weight_reg
 
+        # Compute frame indices for stitching
         frame_starts = torch.arange(N, device=device) * self.length_spectrogram(stride)
-        frame_offsets = torch.arange(F, device=device).unsqueeze(0)  # [1, F]
+        frame_offsets = torch.arange(frames_number, device=device).unsqueeze(
+            0
+        )  # [1, F]
         frame_indices = (frame_starts.unsqueeze(1) + frame_offsets).reshape(-1)  # [N*F]
 
+        # Mask out frames that exceed total_frames
+        valid_mask = frame_indices < total_frames
+
         # Flatten and stitch
-        flat_class = weighted_class.reshape(-1, num_classes)
-        flat_reg = weighted_reg.reshape(-1, num_classes * doa_size)
-        flat_weight_class = weight_class.reshape(-1, num_classes)
-        flat_weight_reg = weight_reg.reshape(-1, num_classes * doa_size)
+        flat_class = weighted_class.reshape(-1, num_classes)[valid_mask]
+        flat_reg = weighted_reg.reshape(-1, num_classes * doa_size)[valid_mask]
+        flat_weight_class = weight_class.reshape(-1, num_classes)[valid_mask]
+        flat_weight_reg = weight_reg.reshape(-1, num_classes * doa_size)[valid_mask]
 
+        # Preallocate buffers
         preds_class_sum = torch.zeros((1, total_frames, num_classes), device=device)
-        preds_reg_sum = torch.zeros((1, total_frames, num_classes * doa_size), device=device)
+        preds_reg_sum = torch.zeros(
+            (1, total_frames, num_classes * doa_size), device=device
+        )
         preds_count_class = torch.zeros((1, total_frames, num_classes), device=device)
-        preds_count_reg = torch.zeros((1, total_frames, num_classes * doa_size), device=device)
+        preds_count_reg = torch.zeros(
+            (1, total_frames, num_classes * doa_size), device=device
+        )
 
-        preds_class_sum[0].index_add_(0, frame_indices, flat_class)
-        preds_reg_sum[0].index_add_(0, frame_indices, flat_reg)
-        preds_count_class[0].index_add_(0, frame_indices, flat_weight_class)
-        preds_count_reg[0].index_add_(0, frame_indices, flat_weight_reg)
+        valid_indices = frame_indices[valid_mask]
+
+        preds_class_sum[0].index_add_(0, valid_indices, flat_class)
+        preds_reg_sum[0].index_add_(0, valid_indices, flat_reg)
+        preds_count_class[0].index_add_(0, valid_indices, flat_weight_class)
+        preds_count_reg[0].index_add_(0, valid_indices, flat_weight_reg)
 
         preds_count_class = preds_count_class.clamp(min=1e-6)
         preds_count_reg = preds_count_reg.clamp(min=1e-6)
@@ -921,7 +968,7 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
 
         return {
             "class_encoder_out": avg_preds_class,  # [1, T', num_classes]
-            "regression_out": avg_preds_reg,       # [1, T', num_classes * doa_size]
+            "regression_out": avg_preds_reg,  # [1, T', num_classes * doa_size]
         }
 
     def sliding_window_overlap(
@@ -950,9 +997,11 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
         doa_size = self.cfg.doa_size
 
         # Unfold into overlapping chunks
-        chunks = source.unfold(-1, window, stride)         # [1, C, N, window]
+        chunks = source.unfold(-1, window, stride)  # [1, C, N, window]
         chunks = chunks.transpose(1, 2).reshape(-1, C, window)  # [N, C, window]
-        chunk_masks = padding_mask.unsqueeze(1).unfold(-1, window, stride).reshape(-1, window)  # [N, window]
+        chunk_masks = (
+            padding_mask.unsqueeze(1).unfold(-1, window, stride).reshape(-1, window)
+        )  # [N, window]
 
         # Inference on all chunks
         out = model(source=chunks, padding_mask=chunk_masks)
@@ -965,7 +1014,9 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
         frame_starts = (
             torch.arange(num_chunks, device=device) * self.length_spectrogram(stride)
         ).unsqueeze(1)  # [N, 1]
-        frame_offsets = torch.arange(frames_per_chunk, device=device).unsqueeze(0)  # [1, F]
+        frame_offsets = torch.arange(frames_per_chunk, device=device).unsqueeze(
+            0
+        )  # [1, F]
         target_indices = (frame_starts + frame_offsets).reshape(-1)  # [N * F]
 
         # Flatten predictions
@@ -975,7 +1026,9 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
 
         # Preallocate buffers
         preds_class_sum = torch.zeros((1, total_frames, num_classes), device=device)
-        preds_reg_sum = torch.zeros((1, total_frames, num_classes * doa_size), device=device)
+        preds_reg_sum = torch.zeros(
+            (1, total_frames, num_classes * doa_size), device=device
+        )
         preds_count = torch.zeros((1, total_frames, 1), device=device)
 
         # Stitch predictions using index_add_
@@ -1006,7 +1059,12 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
                 - sample (dict): the original sample with additional keys
         """
         source = sample["net_input"]["source"]  # (1, C, T)
-        padding_mask = sample["net_input"]["padding_mask"]  # (1, T)
+        if "padding_mask" in sample["net_input"]:
+            padding_mask = sample["net_input"]["padding_mask"]  # (1, T)
+        else:
+            padding_mask = torch.zeros(
+                (1, source.shape[-1]), dtype=torch.bool, device=source.device
+            )  # (1, T)
 
         assert source.shape[0] == 1, (
             f"{source.shape} source batch-size should be 1 in this case"
@@ -1045,7 +1103,12 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
                 - sample (dict): the original sample with additional keys
         """
         source = inputs["net_input"]["source"]  # (1, C, T)
-        padding_mask = inputs["net_input"]["padding_mask"]  # (1, T)
+        if "padding_mask" in inputs["net_input"]:
+            padding_mask = inputs["net_input"]["padding_mask"]  # (1, T)
+        else:
+            padding_mask = torch.zeros(
+                (1, source.shape[-1]), dtype=torch.bool, device=source.device
+            )  # (1, T)
 
         assert source.shape[0] == 1, (
             f"{source.shape} source batch-size should be 1 in this case"
@@ -1505,7 +1568,7 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
         return er, f, de, de_f, seld_score
 
     def eval_seld_score_2018(self, doa_pred, doa_gt, sed_pred, sed_gt):
-        """ Evaluate SELD score for DCASE 2018.
+        """Evaluate SELD score for DCASE 2018.
         Args:
             doa_pred (np.ndarray): predicted DOA values
             doa_gt (np.ndarray): ground truth DOA values
@@ -1528,7 +1591,7 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
         return _er, _f, _doa_err, _frame_recall, _seld_scr
 
     def eval_seld_score_2019(self, doa_pred, doa_gt, sed_pred, sed_gt):
-        """ Evaluate SELD score for DCASE 2019.
+        """Evaluate SELD score for DCASE 2019.
         Args:
             doa_pred (np.ndarray): predicted DOA values
             doa_gt (np.ndarray): ground truth DOA values
