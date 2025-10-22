@@ -1573,7 +1573,7 @@ class Wav2vec2SeldAudioFrameClassEncoder(Wav2vec2SequenceClassEncoder):
         out = self.pool(output.transpose(1, 2))  # [B, D, T_new]
         return out.transpose(1, 2)  # [B, T_new, D]
 
-    def forward(self, source, padding_mask, **kwargs):
+    def forward(self, source, padding_mask=None, **kwargs):
         w2v_args = {
             "source": source,
             "padding_mask": padding_mask,
