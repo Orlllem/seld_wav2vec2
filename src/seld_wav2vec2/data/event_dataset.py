@@ -653,7 +653,6 @@ class FileEventHdfDataset(FileEventDataset):
         self,
         window=47520,
         stride=16000,
-        segment_eval=False,
         split="train",
         doa_discretizer=None,
         doa_size=3,
@@ -663,12 +662,11 @@ class FileEventHdfDataset(FileEventDataset):
         self.min_sample_size = (
             self.min_sample_size if self.min_sample_size is not None else 0
         )
-        self.segment_eval = segment_eval
 
         if apply_record_inference_on_train:
             segment = False
         else:
-            segment = split == "train" or (split != "train" and self.segment_eval)
+            segment = split == "train"
 
         labels = []
         self.fnames_segments = []
