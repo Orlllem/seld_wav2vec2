@@ -37,7 +37,6 @@ def evaluate(
     user_dir,
     doa_size=3,
     data=None,
-    segment_eval=None,
     thr=0.5,
     use_best_threshold=False,
 ):
@@ -50,11 +49,6 @@ def evaluate(
 
     if data is not None:
         task.cfg.data = data
-
-    if segment_eval is not None:
-        task.cfg.segment_eval = bool(segment_eval)
-
-    logger.info(f"evaluating in segment_eval: {task.cfg.segment_eval}")
 
     model.w2v_encoder.apply_mask = False
     task.cfg.audio_augm = False
@@ -82,10 +76,8 @@ def evaluate(
     for batch in batch_itr:
         with torch.no_grad():
             batch = move_to_cuda(batch)
-            if task.cfg.segment_eval:
-                net_output = model(**batch["net_input"])
-            else:
-                net_output, batch = task.inference_step(batch, model)
+
+            net_output, batch = task.inference_step(batch, model)
 
             class_logits = net_output["class_encoder_out"].float()
             reg_logits = net_output["regression_out"].float()
@@ -193,7 +185,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data", type=str, help=("path and name of output metrics file.")
     )
-    parser.add_argument("--segment_eval", type=int, help=("segment_eval [0,1] in cfg."))
     parser.add_argument("--threshold", default=0.5, type=float, help="threshold.")
     parser.add_argument("--use_best_threshold", action="store_true")
 
@@ -206,6 +197,5 @@ if __name__ == "__main__":
         args.user_dir,
         doa_size=args.doa_size,
         data=args.data,
-        segment_eval=args.segment_eval,
         use_best_threshold=args.use_best_threshold,
     )

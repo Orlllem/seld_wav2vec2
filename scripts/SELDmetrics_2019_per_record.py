@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 from fairseq import checkpoint_utils
 from fairseq.utils import move_to_cuda
 from omegaconf import OmegaConf, open_dict
@@ -299,11 +300,13 @@ def evaluate(
     user_dir: str,
     doa_size: int = 3,
     data: str = None,
-    segment_eval: bool = None,
     label_hop_len_s: float = None,
     labels: str = None,
     segment_in_seconds: bool = True,
+    segment_window: int = None,
+    segment_stride: int = None,
     use_best_threshold: bool = True,
+    evaluate_at_100ms: bool = False,
     save_fig: bool = False,
 ) -> None:
     """
@@ -316,11 +319,11 @@ def evaluate(
         user_dir: Path to a python module containing custom extensions.
         doa_size: Size of DOA.
         data: Path to the data.
-        segment_eval: Whether to use segment evaluation.
         label_hop_len_s: Hop length of labels in seconds.
         labels: Path to the labels.
         segment_in_seconds: Whether to use segment window and stride in seconds.
         use_best_threshold: Whether to use the best threshold found during training.
+        evaluate_at_100ms: Whether to adjust model for evaluation at 100ms hop length.
         save_fig: Whether to save SED and DOA plots as PDF files.
     Returns:
         None
@@ -344,11 +347,20 @@ def evaluate(
     if data is not None:
         task.cfg.data = data
 
-    if segment_eval is not None:
-        task.cfg.segment_eval = bool(segment_eval)
-
     if labels is not None:
         task.cfg.labels = labels
+
+    if label_hop_len_s is not None:
+        task.cfg.label_hop_len_s = label_hop_len_s
+
+    if evaluate_at_100ms:
+        logger.info("Evaluating at 100ms hop length.")
+        task.cfg.align_outputs_frames = True
+        model.w2v_encoder.align_100ms = True
+        model.w2v_encoder.pool = nn.AvgPool1d(kernel_size=5, stride=5, ceil_mode=True)
+        model.w2v_encoder.mask_pool = nn.AvgPool1d(
+            kernel_size=5, stride=5, ceil_mode=True
+        )
 
     if segment_in_seconds:
         logger.info("Using segment window and stride in seconds.")
@@ -357,6 +369,9 @@ def evaluate(
         OmegaConf.set_struct(task.cfg, True)
         with open_dict(task.cfg):
             task.cfg.segment_in_seconds = False
+
+        task.cfg.segment_window = segment_window
+        task.cfg.segment_stride = segment_stride
 
     logger.info(f"Evaluating {subset} subset")
 
@@ -386,19 +401,7 @@ def evaluate(
 
     fnames = [i.as_py().decode("utf-8") for i in task.dataset(subset).dataset.fnames]
 
-    if task.cfg.segment_eval:
-        fnames_segments = task.dataset(subset).dataset.fnames_segments
-
-        records_inds = {}
-        for i, fname in enumerate(fnames_segments):
-            records_inds[i] = fnames_segments[i]["fn"]
-
-        assert len(set(records_inds.values())) == len(fnames)
-
-    else:
-        records_inds = fnames
-
-    logger.info(f"records_inds size {len(records_inds)}")
+    logger.info(f"fnames size {len(fnames)}")
 
     num_classes = len(unique_classes)
 
@@ -415,10 +418,7 @@ def evaluate(
             if torch.cuda.is_available():
                 batch = move_to_cuda(batch)
 
-            if task.cfg.segment_eval:
-                net_output = model(**batch["net_input"])
-            else:
-                net_output, batch = task.inference_step(batch, model)
+            net_output, batch = task.inference_step(batch, model)
 
             class_logits = net_output["class_encoder_out"].float()
             reg_logits = net_output["regression_out"].float()
@@ -450,39 +450,12 @@ def evaluate(
             yp = yp.squeeze(0).cpu().numpy().T
             zp = zp.squeeze(0).cpu().numpy().T
 
-            fnames_ref_preds[records_inds[idx]].append(
-                {
+            fnames_ref_preds[fnames[idx]] = {
                     "pred": y_pred,
                     "ref": y_true,
                     "doa_labels": {"x": x, "y": y, "z": z},
                     "doa_preds": {"x": xp, "y": yp, "z": zp},
                 }
-            )
-
-    for key in fnames_ref_preds:
-        preds_list = [item["pred"] for item in fnames_ref_preds[key]]
-        refs_list = [item["ref"] for item in fnames_ref_preds[key]]
-        doa_labels_x_list = [item["doa_labels"]["x"] for item in fnames_ref_preds[key]]
-        doa_labels_y_list = [item["doa_labels"]["y"] for item in fnames_ref_preds[key]]
-        doa_labels_z_list = [item["doa_labels"]["z"] for item in fnames_ref_preds[key]]
-        doa_preds_x_list = [item["doa_preds"]["x"] for item in fnames_ref_preds[key]]
-        doa_preds_y_list = [item["doa_preds"]["y"] for item in fnames_ref_preds[key]]
-        doa_preds_z_list = [item["doa_preds"]["z"] for item in fnames_ref_preds[key]]
-
-        fnames_ref_preds[key] = {
-            "pred": np.concatenate(preds_list, axis=-1),
-            "ref": np.concatenate(refs_list, axis=-1),
-            "doa_labels": {
-                "x": np.concatenate(doa_labels_x_list, axis=-1),
-                "y": np.concatenate(doa_labels_y_list, axis=-1),
-                "z": np.concatenate(doa_labels_z_list, axis=-1),
-            },
-            "doa_preds": {
-                "x": np.concatenate(doa_preds_x_list, axis=-1),
-                "y": np.concatenate(doa_preds_y_list, axis=-1),
-                "z": np.concatenate(doa_preds_z_list, axis=-1),
-            },
-        }
 
     seld_metrics = get_seld_metrics(
         fnames_ref_preds=fnames_ref_preds,
@@ -550,7 +523,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--not_segment_in_seconds", dest="segment_in_seconds", action="store_false"
     )
+    parser.add_argument(
+        "--segment_window",
+        default=None,
+        type=int,
+        help="segment window size (in seconds or number of samples).",
+    )
+    parser.add_argument(
+        "--segment_stride",
+        default=None,
+        type=int,
+        help="segment_stride size (in seconds or number of samples).",
+    )
     parser.add_argument("--use_best_threshold", action="store_true")
+    parser.add_argument("--evaluate_at_100ms", action="store_true")
     parser.add_argument("--save_fig", action="store_true")
 
     args = parser.parse_args()
@@ -565,5 +551,8 @@ if __name__ == "__main__":
         labels=args.labels,
         segment_in_seconds=args.segment_in_seconds,
         use_best_threshold=args.use_best_threshold,
+        evaluate_at_100ms=args.evaluate_at_100ms,
+        segment_window=args.segment_window,
+        segment_stride=args.segment_stride,
         save_fig=args.save_fig,
     )

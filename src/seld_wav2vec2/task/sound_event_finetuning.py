@@ -459,10 +459,6 @@ class SoundEventFinetuningConfig(SoundEventPretrainingConfig):
         default=64,
         metadata={"help": "hdf cache size in fine-tuning"},
     )
-    segment_eval: bool = field(
-        default=False,
-        metadata={"help": "segment the eval datasets"},
-    )
     avg_seld_score: bool = field(
         default=False,
         metadata={"help": "average the seld score"},
@@ -579,21 +575,6 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
                 else:
                     self.cfg.doa_discretizer["n_bins"] = 1
                 self.state["doa_discretizer_tf"] = None
-
-        if self.cfg.avg_seld_score:
-            assert self.cfg.segment_eval is False, (
-                "when using avg_seld_score, segment_eval should be False"
-            )
-
-        if self.cfg.apply_sliding_window_overlap:
-            assert self.cfg.segment_eval is False, (
-                "when using sliding window overlap, segment_eval should be False"
-            )
-
-        if self.cfg.segment_eval is False:
-            assert self.cfg.max_sample_size is None, (
-                "when segment_eval is False, max_sample_size should be None"
-            )
 
     def load_dataset(
         self, split: str, task_cfg: SoundEventFinetuningConfig = None, **kwargs
@@ -802,25 +783,17 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
                 segment_window = int(self.cfg.segment_window * self.cfg.sample_rate)
                 segment_stride = int(self.cfg.segment_stride * self.cfg.sample_rate)
             else:
-                segment_window = int(
-                    self.cfg.segment_window
-                    * self.cfg.sample_rate
-                    * self.cfg.label_hop_len_s
-                )
-                segment_stride = int(
-                    self.cfg.segment_stride
-                    * self.cfg.sample_rate
-                    * self.cfg.label_hop_len_s
-                )
+                segment_window = int(self.cfg.segment_window)
+                segment_stride = int(self.cfg.segment_stride)
 
-            logger.info(
-                f"Segment window: {segment_window}, segment_stride: {segment_stride}"
-            )
+            self.window = segment_window
+            self.stride = segment_stride
+
+            logger.info(f"Segment window: {self.window}, segment_stride: {self.stride}")
 
             labels, doa_discretizer_tf = self.datasets[split].segment_and_get_labels(
-                window=segment_window,
-                stride=segment_stride,
-                segment_eval=self.cfg.segment_eval,
+                window=self.window,
+                stride=self.stride,
                 split=split,
                 doa_discretizer=self.cfg.doa_discretizer
                 if self.cfg.doa_discretizer.flag
@@ -888,20 +861,20 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
         device = source.device
         _, C, T = source.shape
 
-        window = int(self.cfg.segment_window * self.cfg.sample_rate)
-        stride = int(self.cfg.segment_stride * self.cfg.sample_rate)
         total_frames = self.length_spectrogram(T)
         doa_size = self.cfg.doa_size
 
         # Pad to multiple of stride
-        padding_size = window - (source.shape[-1] % stride)
+        padding_size = self.window - (source.shape[-1] % self.stride)
         source = F.pad(source, (0, padding_size), value=0.0)
         padding_mask = F.pad(padding_mask, (0, padding_size), value=True)
 
         # Unfold into overlapping chunks
-        chunks = source.unfold(-1, window, stride)  # [1, C, N, window]
+        chunks = source.unfold(-1, self.window, self.stride)  # [1, C, N, window]
         chunks = chunks.transpose(1, 2).squeeze(0)  # [N, C, window]
-        chunk_masks = padding_mask.unfold(1, window, stride).squeeze(0)  # [N, window]
+        chunk_masks = padding_mask.unfold(1, self.window, self.stride).squeeze(
+            0
+        )  # [N, window]
         N = chunks.shape[0]
 
         # Inference on all chunks
@@ -928,7 +901,9 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
         weighted_reg = reg_preds * weight_reg
 
         # Compute frame indices for stitching
-        frame_starts = torch.arange(N, device=device) * self.length_spectrogram(stride)
+        frame_starts = torch.arange(N, device=device) * self.length_spectrogram(
+            self.stride
+        )
         frame_offsets = torch.arange(frames_number, device=device).unsqueeze(
             0
         )  # [1, F]
@@ -991,16 +966,16 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
         B, C, T = source.shape
         assert B == 1, "Only batch size 1 is supported."
 
-        window = int(self.cfg.segment_window * self.cfg.sample_rate)
-        stride = int(self.cfg.segment_stride * self.cfg.sample_rate)
         total_frames = self.length_spectrogram(T)
         doa_size = self.cfg.doa_size
 
         # Unfold into overlapping chunks
-        chunks = source.unfold(-1, window, stride)  # [1, C, N, window]
-        chunks = chunks.transpose(1, 2).reshape(-1, C, window)  # [N, C, window]
+        chunks = source.unfold(-1, self.window, self.stride)  # [1, C, N, window]
+        chunks = chunks.transpose(1, 2).reshape(-1, C, self.window)  # [N, C, window]
         chunk_masks = (
-            padding_mask.unsqueeze(1).unfold(-1, window, stride).reshape(-1, window)
+            padding_mask.unsqueeze(1)
+            .unfold(-1, self.window, self.stride)
+            .reshape(-1, self.window)
         )  # [N, window]
 
         # Inference on all chunks
@@ -1012,7 +987,8 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
 
         # Compute frame indices for stitching
         frame_starts = (
-            torch.arange(num_chunks, device=device) * self.length_spectrogram(stride)
+            torch.arange(num_chunks, device=device)
+            * self.length_spectrogram(self.stride)
         ).unsqueeze(1)  # [N, 1]
         frame_offsets = torch.arange(frames_per_chunk, device=device).unsqueeze(
             0
@@ -1123,63 +1099,64 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
         net_output = {}
         sample = {}
         sample["ntokens"] = inputs["ntokens"]
-        window = int(self.cfg.segment_window * self.cfg.sample_rate)
+
         sed_labels = inputs["sed_labels"]
         doa_labels = inputs["doa_labels"]
-        for i in range(0, T, window):
-            source_size = len(source_array[i: i + window])
+        for i in range(0, T, self.window):
+            source_size = len(source_array[i: i + self.window])
             source_end = i + source_size
             source_segment = source[:, :, i:source_end]
             padding_mask_segment = padding_mask[:, i:source_end]
 
-            net_output_segment = model(
-                source=source_segment, padding_mask=padding_mask_segment
-            )
             n_frames = self.length_spectrogram(source_size)
 
-            for k in net_output_segment.keys():
-                if net_output_segment[k] is not None:
-                    assert net_output_segment[k].shape[1] == n_frames, (
-                        f"{net_output_segment[k].shape[1]} != {n_frames}"
-                    )
-                    if k not in net_output:
-                        net_output[k] = net_output_segment[k]
-                    else:
-                        net_output[k] = torch.cat(
-                            (net_output[k], net_output_segment[k]), dim=1
-                        )
-                else:
-                    if k not in net_output:
-                        net_output[k] = net_output_segment[k]
-
-            if not self.cfg.get("align_outputs_frames", False):
-                # if align_outputs_frames is False, we need to slice the labels
-                labels_start = self.length_spectrogram(i)
-                if labels_start < 0:
-                    labels_start = 0
-
-                labels_end = labels_start + n_frames
-                labels_size = sed_labels[:, labels_start:labels_end].shape[1]
-
-                assert labels_size == n_frames, (
-                    f"i: {i}, labels_size: {labels_size} != n_frames: {n_frames}, source_size: {source_size}"
+            if n_frames > 0:
+                net_output_segment = model(
+                    source=source_segment, padding_mask=padding_mask_segment
                 )
+                for k in net_output_segment.keys():
+                    if net_output_segment[k] is not None:
+                        assert net_output_segment[k].shape[1] == n_frames, (
+                            f"{net_output_segment[k].shape[1]} != {n_frames}"
+                        )
+                        if k not in net_output:
+                            net_output[k] = net_output_segment[k]
+                        else:
+                            net_output[k] = torch.cat(
+                                (net_output[k], net_output_segment[k]), dim=1
+                            )
+                    else:
+                        if k not in net_output:
+                            net_output[k] = net_output_segment[k]
 
-                if "sed_labels" not in sample:
-                    sample["sed_labels"] = sed_labels[:, labels_start:labels_end]
-                else:
-                    sample["sed_labels"] = torch.cat(
-                        (sample["sed_labels"], sed_labels[:, labels_start:labels_end]),
-                        dim=1,
+                if not self.cfg.get("align_outputs_frames", False):
+                    # if align_outputs_frames is False, we need to slice the labels
+                    labels_start = self.length_spectrogram(i)
+                    if labels_start < 0:
+                        labels_start = 0
+
+                    labels_end = labels_start + n_frames
+                    labels_size = sed_labels[:, labels_start:labels_end].shape[1]
+
+                    assert labels_size == n_frames, (
+                        f"i: {i}, labels_size: {labels_size} != n_frames: {n_frames}, source_size: {source_size}"
                     )
 
-                if "doa_labels" not in sample:
-                    sample["doa_labels"] = doa_labels[:, labels_start:labels_end]
-                else:
-                    sample["doa_labels"] = torch.cat(
-                        (sample["doa_labels"], doa_labels[:, labels_start:labels_end]),
-                        dim=1,
-                    )
+                    if "sed_labels" not in sample:
+                        sample["sed_labels"] = sed_labels[:, labels_start:labels_end]
+                    else:
+                        sample["sed_labels"] = torch.cat(
+                            (sample["sed_labels"], sed_labels[:, labels_start:labels_end]),
+                            dim=1,
+                        )
+
+                    if "doa_labels" not in sample:
+                        sample["doa_labels"] = doa_labels[:, labels_start:labels_end]
+                    else:
+                        sample["doa_labels"] = torch.cat(
+                            (sample["doa_labels"], doa_labels[:, labels_start:labels_end]),
+                            dim=1,
+                        )
 
         if self.cfg.get("align_outputs_frames", False):
             sample["sed_labels"] = sed_labels
@@ -1248,7 +1225,7 @@ class SoundEventFinetuningTask(SoundEventPretrainingTask):
                         for i in np.arange(*self.cfg.opt_threshold_range)
                     ]
 
-                    if self.cfg.eval_dcase != "2020" and self.cfg.segment_eval:
+                    if self.cfg.eval_dcase != "2020":
                         class_probs = np.concatenate(self.class_probs_list, axis=0)
                         class_labels = np.concatenate(self.class_labels_list, axis=0)
                         reg_logits = np.concatenate(self.reg_logits_list, axis=0)

@@ -777,9 +777,7 @@ class MultitaskSeldAudioFrameCartDcaseCriterion(MultitaskSeldAudioFrameCriterion
         3) logging outputs to display while training
         """
 
-        training = self.training or self.task.cfg.segment_eval
-
-        if self.task.cfg.get("apply_record_inference_on_train", False) or (not training):
+        if self.task.cfg.get("apply_record_inference_on_train", False) or (not self.training):
             net_output, sample = self.task.inference_step(sample, model)
         else:
             net_output = model(**sample["net_input"])
@@ -1122,7 +1120,7 @@ class MultitaskSeldAudioFrameCartDcaseGradNormCriterion(
         3) logging outputs to display while training
         """
 
-        if self.training or self.task.cfg.segment_eval:
+        if self.training:
             net_output = model(**sample["net_input"])
         else:
             net_output, sample = self.task.inference_step(sample, model)
@@ -1578,7 +1576,7 @@ class MultitaskSeldAudioFrameCartDiscretizerGradNormCriterion(
         3) logging outputs to display while training
         """
 
-        if self.training or self.task.cfg.segment_eval:
+        if self.training:
             net_output = model(**sample["net_input"])
         else:
             net_output, sample = self.task.inference_step(sample, model)
